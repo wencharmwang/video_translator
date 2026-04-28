@@ -16,10 +16,4 @@ dist/
 # generated media and workdirs
 artifacts/
 *.ocr.srt
-video_test.mov
-video_test_5.mov
-*_zh_CN.mov
-*_yunyang.mov
-*_edge.mov
-*_say.mov
-*_run.mov
+*.mov
