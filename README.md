@@ -32,7 +32,26 @@
 
 ## 安装
 
-从 PyPI 安装：
+推荐安装方式：使用 `pipx` 安装 CLI：
+
+```bash
+pipx install video-translator-cli
+```
+
+如果本机还没有 `pipx`，请先按你所用系统的官方方式安装 `pipx`，再执行上面的命令。
+
+如果你更习惯使用虚拟环境，也可以这样安装：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install video-translator-cli
+```
+
+如果你看到 `externally-managed-environment`，说明当前 Python 由系统包管理器接管，不能直接往系统环境里执行 `pip install`。此时请改用上面的 `pipx` 或 `venv` 方案，不建议直接使用 `--break-system-packages`。
+
+从 PyPI 安装到当前已激活的虚拟环境：
 
 ```bash
 pip install video-translator-cli
