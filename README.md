@@ -35,7 +35,7 @@
 从 PyPI 安装：
 
 ```bash
-pip install video-translator
+pip install video-translator-cli
 ```
 
 从当前仓库安装：
@@ -113,12 +113,12 @@ video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-
 python -m pip install --upgrade build twine
 python -m build
 python -m twine check dist/*
-git tag -a v0.1.1 -m "Release v0.1.1"
+git tag -a v0.1.2 -m "Release v0.1.2"
 git push origin main --tags
 python -m twine upload dist/*
 ```
 
-如果已经在 GitHub 建好仓库，可以基于 `v0.1.1` tag 创建 GitHub Release，并把 `dist/` 里的 wheel 和 sdist 作为 release assets 上传。
+如果已经在 GitHub 建好仓库，可以基于 `v0.1.2` tag 创建 GitHub Release，并把 `dist/` 里的 wheel 和 sdist 作为 release assets 上传。
 
 构建发布产物：
 

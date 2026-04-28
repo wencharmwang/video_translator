@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.2] - 2026-04-28
+
+### Changed
+
+- Renamed the published PyPI distribution from `video-translator` to `video-translator-cli` to avoid a project name ownership conflict on PyPI.
+- Kept the installed CLI commands as `video-translator` and `ocr-subtitles`, so existing command-line usage does not change.
+
 ## [0.1.1] - 2026-04-28
 
 ### Added
