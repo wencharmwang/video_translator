@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from ocr_subtitles import SubtitleBlock
 
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
 DEFAULT_TTS_VOICE = "zh-CN-XiaoyiNeural"
@@ -41,6 +41,9 @@ DEFAULT_TRANSLATE_TIMEOUT = 30
 DEFAULT_EDGE_RATE = "+0%"
 DEFAULT_EDGE_PITCH = "+0Hz"
 DEFAULT_EDGE_VOLUME = "+0%"
+DEFAULT_ASR_DEVICE = "auto"
+DEFAULT_ASR_COMPUTE_TYPE = "default"
+DEFAULT_DEMUCS_DEVICE = "auto"
 DEFAULT_SUBTITLE_SOURCE = "auto"
 DEFAULT_OCR_FPS = 1.0
 DEFAULT_OCR_MIN_CHARS = 10
@@ -87,6 +90,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE, help="Target language for translation, e.g. zh-CN")
     parser.add_argument("--voice", default=DEFAULT_TTS_VOICE, help="Edge TTS voice name")
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL, help="faster-whisper model size, e.g. small or medium")
+    parser.add_argument(
+        "--asr-device",
+        choices=("auto", "cpu", "cuda"),
+        default=DEFAULT_ASR_DEVICE,
+        help="ASR inference device. auto lets faster-whisper choose the best supported backend.",
+    )
+    parser.add_argument(
+        "--asr-compute-type",
+        default=DEFAULT_ASR_COMPUTE_TYPE,
+        help="ASR compute type passed to faster-whisper, e.g. default, float16, int8.",
+    )
     parser.add_argument("--subtitle-source", choices=("auto", "ocr", "asr"), default=DEFAULT_SUBTITLE_SOURCE, help="Subtitle acquisition source: OCR first, ASR only, or auto fallback")
     parser.add_argument("--ocr-fps", type=float, default=DEFAULT_OCR_FPS, help="Frame sampling rate for OCR subtitle extraction")
     parser.add_argument("--ocr-min-chars", type=int, default=DEFAULT_OCR_MIN_CHARS, help="Minimum characters required for an OCR subtitle sample")
@@ -98,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "demucs", "ffmpeg", "none"),
         default="auto",
         help="Voice/background separation strategy",
+    )
+    parser.add_argument(
+        "--demucs-device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default=DEFAULT_DEMUCS_DEVICE,
+        help="Demucs inference device. auto prefers CUDA, then Apple MPS, then CPU.",
     )
     parser.add_argument("--keep-workdir", action="store_true", help="Keep intermediate artifacts")
     parser.add_argument("--dub-volume", type=float, default=0.78, help="Mix weight for synthesized speech")
@@ -195,6 +215,79 @@ def load_ocr_helpers():
     return extract_subtitle_blocks, write_debug_json, write_srt
 
 
+def torch_cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def torch_mps_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.backends.mps.is_built() and torch.backends.mps.is_available())
+    except Exception:
+        return False
+
+
+def resolve_demucs_device(requested_device: str) -> str:
+    if requested_device == "cuda":
+        if not torch_cuda_available():
+            raise RuntimeError("Demucs device 'cuda' was requested, but CUDA is not available in the current PyTorch runtime")
+        return requested_device
+    if requested_device == "mps":
+        if not torch_mps_available():
+            raise RuntimeError("Demucs device 'mps' was requested, but Apple MPS is not available in the current PyTorch runtime")
+        return requested_device
+    if requested_device != "auto":
+        return requested_device
+    if torch_cuda_available():
+        return "cuda"
+    if torch_mps_available():
+        return "mps"
+    return "cpu"
+
+
+def resolve_asr_runtime(requested_device: str, requested_compute_type: str) -> tuple[str, str]:
+    import ctranslate2
+
+    if requested_device == "auto":
+        try:
+            supported_compute_types = ctranslate2.get_supported_compute_types("cuda")
+            device = "cuda"
+        except ValueError:
+            supported_compute_types = ctranslate2.get_supported_compute_types("cpu")
+            device = "cpu"
+    elif requested_device == "cuda":
+        device = "cuda"
+        try:
+            supported_compute_types = ctranslate2.get_supported_compute_types("cuda")
+        except ValueError as exc:
+            raise RuntimeError("ASR device 'cuda' was requested, but faster-whisper/CTranslate2 was installed without CUDA support") from exc
+    else:
+        device = requested_device
+        supported_compute_types = ctranslate2.get_supported_compute_types(device)
+
+    compute_type = requested_compute_type
+    if compute_type == "default":
+        if device == "cuda":
+            if "float16" in supported_compute_types:
+                compute_type = "float16"
+            elif "int8_float16" in supported_compute_types:
+                compute_type = "int8_float16"
+        elif device == "cpu" and "int8" in supported_compute_types:
+            compute_type = "int8"
+    elif compute_type not in supported_compute_types:
+        supported_list = ", ".join(sorted(supported_compute_types))
+        raise RuntimeError(
+            f"ASR compute type '{compute_type}' is not supported for device '{device}'. Supported values: {supported_list}"
+        )
+    return device, compute_type
+
+
 def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
     full_mix = workdir / "full_mix.wav"
     speech_mix = workdir / "speech_input.wav"
@@ -229,9 +322,12 @@ def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
     return full_mix, speech_mix
 
 
-def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path) -> tuple[Path, Path]:
+def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs_device: str) -> tuple[Path, Path]:
     demucs_output = workdir / "demucs"
-    print("[info] Demucs separation started. This step can take several minutes on long videos or on the first run.")
+    print(
+        "[info] Demucs separation started "
+        f"(device={demucs_device}). This step can take several minutes on long videos or on the first run."
+    )
     run_command(
         [
             sys.executable,
@@ -240,6 +336,8 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path) -> tup
             "-n",
             "htdemucs_ft",
             "--two-stems=vocals",
+            "-d",
+            demucs_device,
             "-o",
             str(demucs_output),
             str(full_mix),
@@ -297,18 +395,24 @@ def separate_with_ffmpeg(speech_mix: Path, full_mix: Path, workdir: Path) -> tup
     return vocals, background
 
 
-def separate_audio(strategy: str, speech_mix: Path, full_mix: Path, workdir: Path) -> tuple[Path, Path, str]:
+def separate_audio(
+    strategy: str,
+    speech_mix: Path,
+    full_mix: Path,
+    workdir: Path,
+    demucs_device: str,
+) -> tuple[Path, Path, str]:
     if strategy == "none":
         return speech_mix, full_mix, "none"
     if strategy == "ffmpeg":
         vocals, background = separate_with_ffmpeg(speech_mix, full_mix, workdir)
         return vocals, background, "ffmpeg"
     if strategy == "demucs":
-        vocals, background = separate_with_demucs(speech_mix, full_mix, workdir)
+        vocals, background = separate_with_demucs(speech_mix, full_mix, workdir, demucs_device)
         return vocals, background, "demucs"
 
     try:
-        vocals, background = separate_with_demucs(speech_mix, full_mix, workdir)
+        vocals, background = separate_with_demucs(speech_mix, full_mix, workdir, demucs_device)
         return vocals, background, "demucs"
     except Exception as exc:
         print(f"[warn] Demucs unavailable, falling back to ffmpeg separation: {exc}")
@@ -324,8 +428,15 @@ def iter_chunk_ranges(total_duration: float, chunk_seconds: int) -> Iterable[tup
         start = end
 
 
-def transcribe_audio(vocals_path: Path, model_name: str, chunk_seconds: int) -> list[Segment]:
-    model = load_whisper_model_class()(model_name, device="cpu", compute_type="int8")
+def transcribe_audio(
+    vocals_path: Path,
+    model_name: str,
+    chunk_seconds: int,
+    asr_device: str,
+    asr_compute_type: str,
+) -> list[Segment]:
+    print(f"[info] Loading ASR model '{model_name}' (device={asr_device}, compute_type={asr_compute_type})")
+    model = load_whisper_model_class()(model_name, device=asr_device, compute_type=asr_compute_type)
     duration = ffprobe_duration(vocals_path)
     segments: list[Segment] = []
     chunk_dir = ensure_dir(vocals_path.parent / "chunks")
@@ -574,6 +685,8 @@ def acquire_segments(
     workdir: Path,
     subtitle_source: str,
     asr_model: str,
+    asr_device: str,
+    asr_compute_type: str,
     chunk_seconds: int,
     ocr_fps: float,
     ocr_min_chars: int,
@@ -586,7 +699,7 @@ def acquire_segments(
         if subtitle_source == "ocr":
             raise RuntimeError("OCR subtitle extraction did not yield usable dialogue subtitles")
 
-    segments = transcribe_audio(vocals_path, asr_model, chunk_seconds)
+    segments = transcribe_audio(vocals_path, asr_model, chunk_seconds, asr_device, asr_compute_type)
     return segments, {
         "source_name": "asr",
         "subtitle_language": "unknown",
@@ -888,6 +1001,8 @@ def main() -> None:
     args = parse_args()
     require_binary("ffmpeg")
     require_binary("ffprobe")
+    asr_device, asr_compute_type = resolve_asr_runtime(args.asr_device, args.asr_compute_type)
+    demucs_device = resolve_demucs_device(args.demucs_device)
 
     input_video = args.input_video.resolve()
     if not input_video.exists():
@@ -904,12 +1019,20 @@ def main() -> None:
     print(f"[info] Working directory: {workdir}")
     total_duration = ffprobe_duration(input_video)
     print(f"[info] Video duration: {total_duration:.1f}s")
+    print(f"[info] ASR runtime: device={asr_device}, compute_type={asr_compute_type}")
+    print(f"[info] Demucs runtime: device={demucs_device}")
 
     try:
         print("[info] Extracting source audio")
         full_mix, speech_mix = extract_audio(input_video, workdir)
         print("[info] Separating vocals and background")
-        vocals_path, background_track, separation_mode = separate_audio(args.separator, speech_mix, full_mix, workdir)
+        vocals_path, background_track, separation_mode = separate_audio(
+            args.separator,
+            speech_mix,
+            full_mix,
+            workdir,
+            demucs_device,
+        )
         print(f"[info] Separation mode: {separation_mode}")
 
         print("[info] Acquiring subtitle segments")
@@ -919,6 +1042,8 @@ def main() -> None:
             workdir,
             args.subtitle_source,
             args.asr_model,
+            asr_device,
+            asr_compute_type,
             args.chunk_seconds,
             args.ocr_fps,
             args.ocr_min_chars,
@@ -971,11 +1096,16 @@ def main() -> None:
                 "subtitle_language": subtitle_metadata["subtitle_language"],
                 "translation_skipped": not subtitle_metadata["needs_translation"],
                 "asr_model": args.asr_model,
+                "asr_device": args.asr_device,
+                "resolved_asr_device": asr_device,
+                "asr_compute_type": asr_compute_type,
                 "ocr_fps": args.ocr_fps,
                 "ocr_min_chars": args.ocr_min_chars,
                 "ocr_similarity": args.ocr_similarity,
                 "chunk_seconds": args.chunk_seconds,
                 "separation_mode": separation_mode,
+                "demucs_device": args.demucs_device,
+                "resolved_demucs_device": demucs_device,
                 "tts_backends": sorted(set(tts_backends)),
                 "tts_timeout": args.tts_timeout,
                 "tts_retries": args.tts_retries,

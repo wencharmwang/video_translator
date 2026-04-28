@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.4] - 2026-04-28
+
+### Changed
+
+- Added configurable `--asr-device`, `--asr-compute-type`, and `--demucs-device` flags so runtime hardware selection is no longer hardcoded.
+- Added automatic hardware resolution that prefers CUDA when available, uses Apple MPS for Demucs on supported Macs, and falls back cleanly to CPU when GPU backends are unavailable.
+
 ## [0.1.3] - 2026-04-28
 
 ### Changed
