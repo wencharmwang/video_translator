@@ -28,7 +28,7 @@ from ocr_subtitles import DEFAULT_SIMILARITY as OCR_DEFAULT_SIMILARITY
 from ocr_subtitles import SubtitleBlock, extract_subtitle_blocks, write_debug_json as write_ocr_debug_json, write_srt as write_ocr_srt
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
 DEFAULT_TTS_VOICE = "zh-CN-XiaoyiNeural"

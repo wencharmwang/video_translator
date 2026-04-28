@@ -32,6 +32,12 @@
 
 ## 安装
 
+从 PyPI 安装：
+
+```bash
+pip install video-translator
+```
+
 从当前仓库安装：
 
 ```bash
@@ -48,12 +54,6 @@ pip install -e .
 
 ```bash
 pip install git+ssh://git@github.com/wencharmwang/video_translator.git
-```
-
-发布到 PyPI 之后：
-
-```bash
-pip install video-translator
 ```
 
 如果只想按旧方式装运行依赖，也可以继续使用：
@@ -107,11 +107,25 @@ video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-
 - 变更记录：`CHANGELOG.md`
 - 发布建议遵循 Semantic Versioning
 
+推荐发布流程：
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+git tag -a v0.1.1 -m "Release v0.1.1"
+git push origin main --tags
+python -m twine upload dist/*
+```
+
+如果已经在 GitHub 建好仓库，可以基于 `v0.1.1` tag 创建 GitHub Release，并把 `dist/` 里的 wheel 和 sdist 作为 release assets 上传。
+
 构建发布产物：
 
 ```bash
 python -m pip install --upgrade build twine
 python -m build
+python -m twine check dist/*
 python -m twine upload dist/*
 ```
 
@@ -150,4 +164,7 @@ python -m twine upload dist/*
 - `ffmpeg` 降级方案无法像 Demucs 那样干净地保留背景声，只作为兜底。
 - Edge TTS 和 Google Translate 依赖网络访问。
 - OCR 主流程适合已有烧录字幕的视频；如果 OCR 没抓到可用字幕，会自动回退到 ASR。
-- 仓库暂未附带开源许可证文件；如果要公开分发，建议在发布前补充最终许可证。
+
+## License
+
+本项目使用 MIT License，详见 `LICENSE`。

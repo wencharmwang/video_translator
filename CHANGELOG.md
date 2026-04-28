@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.1] - 2026-04-28
+
+### Added
+
+- Added an MIT `LICENSE` file for open source distribution.
+- Added package license metadata so PyPI and built distributions include the project license.
+
+### Changed
+
+- Refreshed `README.md` with PyPI installation, release, and tagging instructions.
+- Prepared the project for the first tagged release workflow based on the packaged CLI entry points.
+
 ## [0.1.0] - 2026-04-28
 
 ### Added
