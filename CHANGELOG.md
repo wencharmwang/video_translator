@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.3] - 2026-04-28
+
+### Changed
+
+- Added stage progress output for long-running ASR, translation, TTS, and Demucs separation steps so the CLI no longer appears stalled during long videos.
+- Delayed importing OCR and faster-whisper dependencies until those stages are needed, which avoids the startup-time macOS AVFoundation duplicate class warnings on help and other lightweight CLI paths.
+
 ## [0.1.2] - 2026-04-28
 
 ### Changed

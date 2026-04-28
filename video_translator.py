@@ -18,17 +18,16 @@ import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import TYPE_CHECKING, Iterable, Protocol
 
 import edge_tts
 from deep_translator import GoogleTranslator, MyMemoryTranslator
-from faster_whisper import WhisperModel
-from ocr_subtitles import DEFAULT_MIN_CHARS as OCR_DEFAULT_MIN_CHARS
-from ocr_subtitles import DEFAULT_SIMILARITY as OCR_DEFAULT_SIMILARITY
-from ocr_subtitles import SubtitleBlock, extract_subtitle_blocks, write_debug_json as write_ocr_debug_json, write_srt as write_ocr_srt
+
+if TYPE_CHECKING:
+    from ocr_subtitles import SubtitleBlock
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
 DEFAULT_TTS_VOICE = "zh-CN-XiaoyiNeural"
@@ -44,6 +43,8 @@ DEFAULT_EDGE_PITCH = "+0Hz"
 DEFAULT_EDGE_VOLUME = "+0%"
 DEFAULT_SUBTITLE_SOURCE = "auto"
 DEFAULT_OCR_FPS = 1.0
+DEFAULT_OCR_MIN_CHARS = 10
+DEFAULT_OCR_SIMILARITY = 0.72
 DUB_SAMPLE_RATE = 44100
 DUB_CHANNELS = 1
 MIN_AUDIO_FIT_RATIO = 0.92
@@ -88,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL, help="faster-whisper model size, e.g. small or medium")
     parser.add_argument("--subtitle-source", choices=("auto", "ocr", "asr"), default=DEFAULT_SUBTITLE_SOURCE, help="Subtitle acquisition source: OCR first, ASR only, or auto fallback")
     parser.add_argument("--ocr-fps", type=float, default=DEFAULT_OCR_FPS, help="Frame sampling rate for OCR subtitle extraction")
-    parser.add_argument("--ocr-min-chars", type=int, default=OCR_DEFAULT_MIN_CHARS, help="Minimum characters required for an OCR subtitle sample")
-    parser.add_argument("--ocr-similarity", type=float, default=OCR_DEFAULT_SIMILARITY, help="Similarity threshold for merging OCR subtitle samples")
+    parser.add_argument("--ocr-min-chars", type=int, default=DEFAULT_OCR_MIN_CHARS, help="Minimum characters required for an OCR subtitle sample")
+    parser.add_argument("--ocr-similarity", type=float, default=DEFAULT_OCR_SIMILARITY, help="Similarity threshold for merging OCR subtitle samples")
     parser.add_argument("--chunk-seconds", type=int, default=DEFAULT_CHUNK_SECONDS, help="Chunk duration for ASR processing")
     parser.add_argument("--workdir", type=Path, default=None, help="Directory for intermediate files")
     parser.add_argument(
@@ -120,8 +121,24 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_command(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, text=True, capture_output=True)
+def run_command(
+    command: list[str],
+    *,
+    check: bool = True,
+    heartbeat_message: str | None = None,
+    heartbeat_interval: float = 20.0,
+) -> subprocess.CompletedProcess[str]:
+    if heartbeat_message is None:
+        result = subprocess.run(command, text=True, capture_output=True)
+    else:
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=heartbeat_interval)
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                break
+            except subprocess.TimeoutExpired:
+                print(f"[info] {heartbeat_message}")
     if check and result.returncode != 0:
         raise RuntimeError(
             "Command failed:\n"
@@ -156,6 +173,26 @@ def ffprobe_duration(path: Path) -> float:
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def log_progress(stage: str, current: int, total: int, *, detail: str = "") -> None:
+    if total <= 0:
+        return
+    if total <= 20 or current == 1 or current == total or current % 10 == 0:
+        suffix = f" - {detail}" if detail else ""
+        print(f"[info] {stage}: {current}/{total}{suffix}")
+
+
+def load_whisper_model_class():
+    from faster_whisper import WhisperModel
+
+    return WhisperModel
+
+
+def load_ocr_helpers():
+    from ocr_subtitles import extract_subtitle_blocks, write_debug_json, write_srt
+
+    return extract_subtitle_blocks, write_debug_json, write_srt
 
 
 def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
@@ -194,6 +231,7 @@ def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
 
 def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path) -> tuple[Path, Path]:
     demucs_output = workdir / "demucs"
+    print("[info] Demucs separation started. This step can take several minutes on long videos or on the first run.")
     run_command(
         [
             sys.executable,
@@ -205,7 +243,8 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path) -> tup
             "-o",
             str(demucs_output),
             str(full_mix),
-        ]
+        ],
+        heartbeat_message="Demucs is still separating vocals and background...",
     )
     separated_dir = demucs_output / "htdemucs_ft" / full_mix.stem
     vocals = separated_dir / "vocals.wav"
@@ -286,12 +325,14 @@ def iter_chunk_ranges(total_duration: float, chunk_seconds: int) -> Iterable[tup
 
 
 def transcribe_audio(vocals_path: Path, model_name: str, chunk_seconds: int) -> list[Segment]:
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = load_whisper_model_class()(model_name, device="cpu", compute_type="int8")
     duration = ffprobe_duration(vocals_path)
     segments: list[Segment] = []
     chunk_dir = ensure_dir(vocals_path.parent / "chunks")
+    chunk_ranges = list(iter_chunk_ranges(duration, chunk_seconds))
 
-    for index, (start, end) in enumerate(iter_chunk_ranges(duration, chunk_seconds)):
+    for index, (start, end) in enumerate(chunk_ranges, start=1):
+        log_progress("ASR chunk", index, len(chunk_ranges), detail=f"{start:.0f}s-{end:.0f}s")
         chunk_path = chunk_dir / f"chunk_{index:04d}.wav"
         run_command(
             [
@@ -428,7 +469,9 @@ def translate_batch_with_fallback(texts: list[str], target_language: str, retrie
 
 def translate_segments(segments: list[Segment], target_language: str, retries: int, batch_size: int, timeout_seconds: int) -> None:
     safe_batch_size = max(1, batch_size)
-    for batch_start in range(0, len(segments), safe_batch_size):
+    total_batches = (len(segments) + safe_batch_size - 1) // safe_batch_size
+    for batch_index, batch_start in enumerate(range(0, len(segments), safe_batch_size), start=1):
+        log_progress("Translation batch", batch_index, total_batches)
         batch = segments[batch_start : batch_start + safe_batch_size]
         translated_texts = translate_batch_with_fallback([segment.source_text for segment in batch], target_language, retries, timeout_seconds)
         for segment, translated_text in zip(batch, translated_texts, strict=True):
@@ -486,6 +529,7 @@ def build_segments_from_subtitle_blocks(blocks: list[SubtitleBlock], prefer_chin
 
 
 def acquire_ocr_segments(input_video: Path, workdir: Path, fps: float, min_chars: int, similarity: float) -> tuple[list[Segment], dict[str, object]]:
+    extract_subtitle_blocks, write_ocr_debug_json, write_ocr_srt = load_ocr_helpers()
     ocr_workdir = ensure_dir(workdir / "ocr")
     samples, blocks = extract_subtitle_blocks(
         input_video=input_video,
@@ -557,7 +601,9 @@ def translate_missing_segments(segments: list[Segment], target_language: str, re
     if not pending:
         return
     safe_batch_size = max(1, batch_size)
-    for batch_start in range(0, len(pending), safe_batch_size):
+    total_batches = (len(pending) + safe_batch_size - 1) // safe_batch_size
+    for batch_index, batch_start in enumerate(range(0, len(pending), safe_batch_size), start=1):
+        log_progress("Translation batch", batch_index, total_batches)
         batch = pending[batch_start : batch_start + safe_batch_size]
         translated_texts = translate_batch_with_fallback([segment.source_text for segment in batch], target_language, retries, timeout_seconds)
         for segment, translated_text in zip(batch, translated_texts, strict=True):
@@ -697,8 +743,10 @@ def synthesize_segments(
     entries: list[Path] = []
     tts_backends: list[str] = []
     cursor = 0.0
+    total_segments = len(segments)
 
     for index, segment in enumerate(segments, start=1):
+        log_progress("TTS segment", index, total_segments, detail=f"{segment.start:.1f}s-{segment.end:.1f}s")
         original_start = segment.start
         original_end = segment.end
         scheduled_start = max(original_start, cursor)
@@ -858,10 +906,13 @@ def main() -> None:
     print(f"[info] Video duration: {total_duration:.1f}s")
 
     try:
+        print("[info] Extracting source audio")
         full_mix, speech_mix = extract_audio(input_video, workdir)
+        print("[info] Separating vocals and background")
         vocals_path, background_track, separation_mode = separate_audio(args.separator, speech_mix, full_mix, workdir)
         print(f"[info] Separation mode: {separation_mode}")
 
+        print("[info] Acquiring subtitle segments")
         segments, subtitle_metadata = acquire_segments(
             input_video,
             vocals_path,
@@ -877,12 +928,14 @@ def main() -> None:
         print(f"[info] Prepared {len(segments)} segments")
 
         if subtitle_metadata["needs_translation"]:
+            print("[info] Translating subtitle text")
             translate_missing_segments(segments, args.target_language, args.translate_retries, args.translate_batch_size, args.translate_timeout)
         else:
             for segment in segments:
                 segment.translated_text = segment.source_text
         source_srt = write_srt(segments, workdir / "source.srt", "source_text")
         translated_srt = write_srt(segments, workdir / "translated.srt", "translated_text")
+        print("[info] Synthesizing dubbed speech")
         dub_track, tts_backends = synthesize_segments(
             segments,
             args.voice,
@@ -894,6 +947,7 @@ def main() -> None:
             args.edge_pitch,
             args.edge_volume,
         )
+        print("[info] Mixing dubbed speech back into the video")
         mix_audio(
             input_video,
             background_track,
