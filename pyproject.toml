@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-translator"
+dynamic = ["version"]
+description = "OCR-first video translation and dubbing CLI built on ffmpeg, Whisper, Edge TTS, and RapidOCR"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "wencharmwang"},
+]
+keywords = ["video", "translation", "subtitle", "ocr", "tts", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "deep-translator",
+  "demucs",
+  "edge-tts",
+  "faster-whisper",
+  "rapidocr-onnxruntime",
+  "requests",
+]
+
+[project.urls]
+Homepage = "https://github.com/wencharmwang/video_translator"
+Repository = "https://github.com/wencharmwang/video_translator"
+Issues = "https://github.com/wencharmwang/video_translator/issues"
+
+[project.scripts]
+video-translator = "video_translator:main"
+ocr-subtitles = "ocr_subtitles:main"
+
+[tool.setuptools]
+py-modules = ["video_translator", "ocr_subtitles"]
+
+[tool.setuptools.dynamic]
+version = {attr = "video_translator.__version__"}

@@ -1,0 +1,25 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+
+# local OCR / translation caches
+.argostranslate/
+
+# generated media and workdirs
+artifacts/
+*.ocr.srt
+video_test.mov
+video_test_5.mov
+*_zh_CN.mov
+*_yunyang.mov
+*_edge.mov
+*_say.mov
+*_run.mov

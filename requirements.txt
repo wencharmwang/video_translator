@@ -1,0 +1,6 @@
+faster-whisper
+deep-translator
+edge-tts
+demucs
+rapidocr-onnxruntime
+requests
