@@ -17,3 +17,5 @@ dist/
 artifacts/
 *.ocr.srt
 *.mov
+samples/
+SPEC.MD

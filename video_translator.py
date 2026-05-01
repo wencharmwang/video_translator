@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import re
 import requests
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Protocol
 
 import edge_tts
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import GoogleTranslator
 
 if TYPE_CHECKING:
     from ocr_subtitles import SubtitleBlock
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 __version__ = "0.1.4"
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
-DEFAULT_TTS_VOICE = "zh-CN-XiaoyiNeural"
+DEFAULT_TTS_VOICE = "zh-CN-YunjianNeural"
 DEFAULT_ASR_MODEL = "small"
 DEFAULT_CHUNK_SECONDS = 300
 DEFAULT_TTS_TIMEOUT = 60
@@ -38,6 +39,7 @@ DEFAULT_TTS_RETRIES = 3
 DEFAULT_TRANSLATE_RETRIES = 3
 DEFAULT_TRANSLATE_BATCH_SIZE = 12
 DEFAULT_TRANSLATE_TIMEOUT = 30
+DEFAULT_TRANSLATION_PROVIDER = "hy-local"
 DEFAULT_EDGE_RATE = "+0%"
 DEFAULT_EDGE_PITCH = "+0Hz"
 DEFAULT_EDGE_VOLUME = "+0%"
@@ -48,11 +50,50 @@ DEFAULT_SUBTITLE_SOURCE = "auto"
 DEFAULT_OCR_FPS = 1.0
 DEFAULT_OCR_MIN_CHARS = 10
 DEFAULT_OCR_SIMILARITY = 0.72
+DEFAULT_HY_MODEL = "tencent/HY-MT1.5-1.8B"
+DEFAULT_HY_GPTQ_MODEL = "tencent/HY-MT1.5-1.8B-GPTQ-Int4"
+DEFAULT_HY_FP8_MODEL = "tencent/HY-MT1.5-1.8B-FP8"
+DEFAULT_HY_DEVICE = "auto"
+DEFAULT_HY_MAX_NEW_TOKENS = 256
 DUB_SAMPLE_RATE = 44100
 DUB_CHANNELS = 1
+DEFAULT_BATCH_OUTPUT_DIRNAME = "translated_videos"
 MIN_AUDIO_FIT_RATIO = 0.92
 MAX_AUDIO_FIT_RATIO = 1.22
 SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？", "…")
+
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".m4v",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".mpg",
+    ".mpeg",
+}
+
+HY_MT_LANGUAGE_NAMES = {
+    "zh": "中文",
+    "zh-Hant": "繁体中文",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "it": "Italian",
+    "vi": "Vietnamese",
+    "th": "Thai",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tr": "Turkish",
+}
 
 
 @dataclass(slots=True)
@@ -75,6 +116,21 @@ class BatchTranslator(Protocol):
     def translate_batch(self, batch: list[str]) -> list[str]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class TranslationBackend:
+    name: str
+    translator: BatchTranslator
+    uses_network_timeout: bool
+
+
+@dataclass(slots=True)
+class HyMtRuntime:
+    tokenizer: object
+    model: object
+    device: str
+    model_id: str
+
+
 class SubtitleAcquisition(Protocol):
     source_name: str
     subtitle_language: str
@@ -86,6 +142,7 @@ class SubtitleAcquisition(Protocol):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate a video into a target language and rebuild the dubbed video.")
     parser.add_argument("--video", type=Path, default=None, help="Path to the source video file")
+    parser.add_argument("--input-dir", type=Path, default=None, help="Process all supported video files in a directory")
     parser.add_argument("--output", type=Path, default=None, help="Path to the translated output video")
     parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE, help="Target language for translation, e.g. zh-CN")
     parser.add_argument("--voice", default=DEFAULT_TTS_VOICE, help="Edge TTS voice name")
@@ -124,20 +181,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-volume", type=float, default=1.18, help="Mix weight for background audio")
     parser.add_argument("--tts-timeout", type=int, default=DEFAULT_TTS_TIMEOUT, help="Per-request timeout in seconds for Edge TTS")
     parser.add_argument("--tts-retries", type=int, default=DEFAULT_TTS_RETRIES, help="Retry count before falling back to local TTS")
-    parser.add_argument("--translate-retries", type=int, default=DEFAULT_TRANSLATE_RETRIES, help="Retry count per translator before switching to the next translation backend")
+    parser.add_argument(
+        "--translation-provider",
+        choices=("hy-local", "google"),
+        default=DEFAULT_TRANSLATION_PROVIDER,
+        help="Translation backend. hy-local uses the local Tencent HY-MT model by default; google uses Google Translate explicitly.",
+    )
+    parser.add_argument("--translate-retries", type=int, default=DEFAULT_TRANSLATE_RETRIES, help="Retry count for the selected translation backend")
     parser.add_argument("--translate-batch-size", type=int, default=DEFAULT_TRANSLATE_BATCH_SIZE, help="Number of segments to send in each batch translation request")
-    parser.add_argument("--translate-timeout", type=int, default=DEFAULT_TRANSLATE_TIMEOUT, help="Timeout in seconds for each translation HTTP request")
+    parser.add_argument("--translate-timeout", type=int, default=DEFAULT_TRANSLATE_TIMEOUT, help="Timeout in seconds for each translation HTTP request when using network translators")
+    parser.add_argument("--hy-model", default=DEFAULT_HY_MODEL, help="Base HY-MT Hugging Face model id")
+    parser.add_argument(
+        "--hy-device",
+        choices=("auto", "cpu", "mps", "cuda"),
+        default=DEFAULT_HY_DEVICE,
+        help="Runtime device for the local HY-MT translation model.",
+    )
+    parser.add_argument("--hy-max-new-tokens", type=int, default=DEFAULT_HY_MAX_NEW_TOKENS, help="Maximum number of tokens to generate per HY-MT translation segment")
     parser.add_argument("--edge-rate", default=DEFAULT_EDGE_RATE, help="Edge TTS base speaking rate, e.g. -8%% or +5%%")
     parser.add_argument("--edge-pitch", default=DEFAULT_EDGE_PITCH, help="Edge TTS pitch, e.g. -12Hz")
     parser.add_argument("--edge-volume", default=DEFAULT_EDGE_VOLUME, help="Edge TTS volume, e.g. +0%%")
     raw_args = sys.argv[1:]
-    if raw_args and not raw_args[0].startswith("-") and "--video" not in raw_args:
-        raw_args = ["--video", raw_args[0], *raw_args[1:]]
+    if raw_args and not raw_args[0].startswith("-") and "--video" not in raw_args and "--input-dir" not in raw_args:
+        candidate = Path(raw_args[0]).expanduser()
+        inferred_flag = "--input-dir" if candidate.is_dir() else "--video"
+        raw_args = [inferred_flag, raw_args[0], *raw_args[1:]]
 
     args = parser.parse_args(raw_args)
     args.input_video = args.video
-    if args.input_video is None:
-        parser.error("one of the following arguments is required: --video")
+    if args.video and args.input_dir:
+        parser.error("--video and --input-dir are mutually exclusive")
+    if args.input_video is None and args.input_dir is None:
+        parser.error("one of the following arguments is required: --video, --input-dir")
+    if args.input_dir is not None and args.output is not None and args.output.suffix:
+        parser.error("--output must be a directory path when used with --input-dir")
     return args
 
 
@@ -514,12 +591,191 @@ def merge_close_segments(
     return merged
 
 
-def build_translators(target_language: str) -> list[tuple[str, BatchTranslator]]:
+def normalize_hy_language_code(target_language: str) -> str:
+    normalized = normalize_translate_code(target_language)
+    mapping = {
+        "zh-CN": "zh",
+        "zh-cn": "zh",
+        "zh-TW": "zh-Hant",
+        "zh-tw": "zh-Hant",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def hy_target_language_name(target_language: str) -> str:
+    normalized = normalize_hy_language_code(target_language)
+    return HY_MT_LANGUAGE_NAMES.get(normalized, normalized)
+
+
+def resolve_hy_device(requested_device: str) -> str:
+    if requested_device != "auto":
+        return requested_device
+
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def build_hy_prompt(source_text: str, target_language: str) -> str:
+    target_name = hy_target_language_name(target_language)
+    normalized_target = normalize_hy_language_code(target_language)
+    if normalized_target.startswith("zh"):
+        return f"将以下文本翻译为{target_name}，注意只需要输出翻译后的结果，不要额外解释：\n\n{source_text}"
+    return f"Translate the following segment into {target_name}, without additional explanation.\n\n{source_text}"
+
+
+def clean_hy_translation(text: str) -> str:
+    normalized = text.strip()
+    target_match = re.search(r"<target>(.*?)</target>", normalized, flags=re.DOTALL)
+    if target_match:
+        normalized = target_match.group(1).strip()
+    normalized = re.sub(r"^(assistant|译文)\s*[:：]\s*", "", normalized, flags=re.IGNORECASE)
+    return normalized.strip()
+
+
+def resolve_hy_model_candidates(base_model: str, resolved_device: str) -> list[str]:
+    if resolved_device == "cuda":
+        return [DEFAULT_HY_GPTQ_MODEL, DEFAULT_HY_FP8_MODEL, base_model]
+    return [base_model]
+
+
+@functools.lru_cache(maxsize=8)
+def load_hy_runtime(base_model: str, requested_device: str) -> HyMtRuntime:
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "HY-MT local translation requires transformers. Install it with: pip install transformers==4.56.0"
+        ) from exc
+
+    resolved_device = resolve_hy_device(requested_device)
+    candidates = resolve_hy_model_candidates(base_model, resolved_device)
+    errors: list[str] = []
+
+    for model_id in candidates:
+        try:
+            if model_id == DEFAULT_HY_GPTQ_MODEL and resolved_device != "cuda":
+                raise RuntimeError("GPTQ Int4 HY-MT is only attempted on CUDA runtimes")
+            if model_id == DEFAULT_HY_FP8_MODEL:
+                raise RuntimeError("FP8 HY-MT requires extra compressed-tensors setup and is skipped by default")
+
+            print(f"[info] Loading translation model: {model_id} (device={resolved_device})")
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            dtype = torch.float32 if resolved_device == "cpu" else torch.float16
+            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+            model.eval()
+            if resolved_device != "cpu":
+                model.to(resolved_device)
+            return HyMtRuntime(tokenizer=tokenizer, model=model, device=resolved_device, model_id=model_id)
+        except Exception as exc:
+            errors.append(f"{model_id}: {exc}")
+
+    joined_errors = " | ".join(errors)
+    raise RuntimeError(f"Failed to load HY-MT translation model. {joined_errors}")
+
+
+class HyLocalTranslator:
+    def __init__(self, target_language: str, model_id: str, requested_device: str, max_new_tokens: int):
+        self.target_language = target_language
+        self.model_id = model_id
+        self.requested_device = requested_device
+        self.max_new_tokens = max(32, max_new_tokens)
+
+    def translate_batch(self, batch: list[str]) -> list[str]:
+        if not batch:
+            return []
+
+        import torch
+
+        runtime = load_hy_runtime(self.model_id, self.requested_device)
+        results: list[str] = []
+        for text in batch:
+            prompt = build_hy_prompt(text, self.target_language)
+            messages = [{"role": "user", "content": prompt}]
+            if hasattr(runtime.tokenizer, "apply_chat_template"):
+                input_ids = runtime.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+            else:
+                input_ids = runtime.tokenizer(prompt, return_tensors="pt").input_ids
+            input_ids = input_ids.to(runtime.device)
+            attention_mask = torch.ones_like(input_ids)
+            with torch.inference_mode():
+                outputs = runtime.model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_k=20,
+                    top_p=0.6,
+                    repetition_penalty=1.05,
+                    pad_token_id=getattr(runtime.tokenizer, "pad_token_id", None) or getattr(runtime.tokenizer, "eos_token_id", None),
+                    eos_token_id=getattr(runtime.tokenizer, "eos_token_id", None),
+                )
+            generated_ids = outputs[:, input_ids.shape[-1] :]
+            translated = runtime.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            cleaned = clean_hy_translation(translated)
+            if not cleaned:
+                raise RuntimeError(f"HY-MT returned empty text for source segment: {text!r}")
+            results.append(cleaned)
+        return results
+
+    def resolved_model_id(self) -> str | None:
+        try:
+            return load_hy_runtime(self.model_id, self.requested_device).model_id
+        except Exception:
+            return None
+
+    def resolved_device(self) -> str | None:
+        try:
+            return load_hy_runtime(self.model_id, self.requested_device).device
+        except Exception:
+            return None
+
+
+def translation_backend_metadata(backend: TranslationBackend, *, resolve_runtime: bool = False) -> dict[str, str | None]:
+    metadata = {
+        "resolved_translation_provider": backend.name,
+        "translation_model": None,
+        "resolved_translation_device": None,
+    }
+    if isinstance(backend.translator, HyLocalTranslator):
+        metadata["translation_model"] = backend.translator.model_id
+        metadata["resolved_translation_device"] = resolve_hy_device(backend.translator.requested_device)
+        if resolve_runtime:
+            metadata["translation_model"] = backend.translator.resolved_model_id() or metadata["translation_model"]
+            metadata["resolved_translation_device"] = backend.translator.resolved_device() or metadata["resolved_translation_device"]
+    return metadata
+
+
+def build_translation_backend(
+    target_language: str,
+    provider: str,
+    hy_model: str,
+    hy_device: str,
+    hy_max_new_tokens: int,
+) -> TranslationBackend:
     normalized_target = normalize_translate_code(target_language)
-    return [
-        ("google", GoogleTranslator(source="auto", target=normalized_target)),
-        ("mymemory", MyMemoryTranslator(source="auto", target=normalized_target)),
-    ]
+    if provider == "google":
+        return TranslationBackend(
+            name="google",
+            translator=GoogleTranslator(source="auto", target=normalized_target),
+            uses_network_timeout=True,
+        )
+    return TranslationBackend(
+        name="hy-local",
+        translator=HyLocalTranslator(target_language, hy_model, hy_device, hy_max_new_tokens),
+        uses_network_timeout=False,
+    )
 
 
 @contextlib.contextmanager
@@ -557,34 +813,35 @@ def run_with_timeout(timeout_seconds: int, operation):
         signal.signal(signal.SIGALRM, previous_handler)
 
 
-def translate_batch_with_fallback(texts: list[str], target_language: str, retries: int, timeout_seconds: int) -> list[str]:
-    translators = build_translators(target_language)
+def translate_batch_with_backend(texts: list[str], backend: TranslationBackend, retries: int, timeout_seconds: int) -> list[str]:
     last_error: Exception | None = None
-    for provider_name, translator in translators:
-        for attempt in range(1, retries + 1):
-            try:
+    for attempt in range(1, retries + 1):
+        try:
+            if backend.uses_network_timeout:
                 with requests_timeout(timeout_seconds):
-                    translated = run_with_timeout(timeout_seconds, lambda: translator.translate_batch(texts))
-                if len(translated) != len(texts):
-                    raise RuntimeError(f"{provider_name} returned {len(translated)} items for {len(texts)} inputs")
-                normalized = [item.strip() if item else "" for item in translated]
-                if any(not item for item in normalized):
-                    raise RuntimeError(f"{provider_name} returned empty text inside a batch")
-                return normalized
-            except Exception as exc:
-                last_error = exc
-                if attempt < retries:
-                    time.sleep(min(attempt, 3))
-    raise RuntimeError(f"Failed to translate batch within timeout={timeout_seconds}s. Last error: {last_error}")
+                    translated = run_with_timeout(timeout_seconds, lambda: backend.translator.translate_batch(texts))
+            else:
+                translated = backend.translator.translate_batch(texts)
+            if len(translated) != len(texts):
+                raise RuntimeError(f"{backend.name} returned {len(translated)} items for {len(texts)} inputs")
+            normalized = [item.strip() if item else "" for item in translated]
+            if any(not item for item in normalized):
+                raise RuntimeError(f"{backend.name} returned empty text inside a batch")
+            return normalized
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(min(attempt, 3))
+    raise RuntimeError(f"Failed to translate batch with provider={backend.name}. Last error: {last_error}")
 
 
-def translate_segments(segments: list[Segment], target_language: str, retries: int, batch_size: int, timeout_seconds: int) -> None:
+def translate_segments(segments: list[Segment], backend: TranslationBackend, retries: int, batch_size: int, timeout_seconds: int) -> None:
     safe_batch_size = max(1, batch_size)
     total_batches = (len(segments) + safe_batch_size - 1) // safe_batch_size
     for batch_index, batch_start in enumerate(range(0, len(segments), safe_batch_size), start=1):
         log_progress("Translation batch", batch_index, total_batches)
         batch = segments[batch_start : batch_start + safe_batch_size]
-        translated_texts = translate_batch_with_fallback([segment.source_text for segment in batch], target_language, retries, timeout_seconds)
+        translated_texts = translate_batch_with_backend([segment.source_text for segment in batch], backend, retries, timeout_seconds)
         for segment, translated_text in zip(batch, translated_texts, strict=True):
             segment.translated_text = translated_text
 
@@ -709,18 +966,31 @@ def acquire_segments(
     }
 
 
-def translate_missing_segments(segments: list[Segment], target_language: str, retries: int, batch_size: int, timeout_seconds: int) -> None:
+def translate_missing_segments(
+    segments: list[Segment],
+    target_language: str,
+    provider: str,
+    retries: int,
+    batch_size: int,
+    timeout_seconds: int,
+    hy_model: str,
+    hy_device: str,
+    hy_max_new_tokens: int,
+) -> TranslationBackend:
     pending = [segment for segment in segments if not segment.translated_text.strip()]
+    backend = build_translation_backend(target_language, provider, hy_model, hy_device, hy_max_new_tokens)
     if not pending:
-        return
+        return backend
+    print(f"[info] Translation provider: {backend.name}")
     safe_batch_size = max(1, batch_size)
     total_batches = (len(pending) + safe_batch_size - 1) // safe_batch_size
     for batch_index, batch_start in enumerate(range(0, len(pending), safe_batch_size), start=1):
         log_progress("Translation batch", batch_index, total_batches)
         batch = pending[batch_start : batch_start + safe_batch_size]
-        translated_texts = translate_batch_with_fallback([segment.source_text for segment in batch], target_language, retries, timeout_seconds)
+        translated_texts = translate_batch_with_backend([segment.source_text for segment in batch], backend, retries, timeout_seconds)
         for segment, translated_text in zip(batch, translated_texts, strict=True):
             segment.translated_text = translated_text
+    return backend
 
 
 def normalize_translate_code(target_language: str) -> str:
@@ -991,6 +1261,209 @@ def default_output_path(input_video: Path, target_language: str) -> Path:
     return input_video.with_name(f"{input_video.stem}_{suffix}{input_video.suffix}")
 
 
+def is_supported_video_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def collect_input_videos(input_dir: Path) -> list[Path]:
+    videos = [path for path in sorted(input_dir.iterdir()) if is_supported_video_file(path)]
+    if not videos:
+        raise FileNotFoundError(f"No supported video files found in: {input_dir}")
+    return videos
+
+
+def resolve_batch_output_dir(input_dir: Path, output_arg: Path | None) -> Path:
+    if output_arg is None:
+        return ensure_dir(input_dir / DEFAULT_BATCH_OUTPUT_DIRNAME)
+    return ensure_dir(output_arg.resolve())
+
+
+def run_translation(args: argparse.Namespace, input_video: Path, output_video: Path, workdir: Path) -> None:
+    asr_device, asr_compute_type = resolve_asr_runtime(args.asr_device, args.asr_compute_type)
+    demucs_device = resolve_demucs_device(args.demucs_device)
+
+    print(f"[info] Working directory: {workdir}")
+    total_duration = ffprobe_duration(input_video)
+    print(f"[info] Video duration: {total_duration:.1f}s")
+    print(f"[info] ASR runtime: device={asr_device}, compute_type={asr_compute_type}")
+    print(f"[info] Demucs runtime: device={demucs_device}")
+
+    print("[info] Extracting source audio")
+    full_mix, speech_mix = extract_audio(input_video, workdir)
+    print("[info] Separating vocals and background")
+    vocals_path, background_track, separation_mode = separate_audio(
+        args.separator,
+        speech_mix,
+        full_mix,
+        workdir,
+        demucs_device,
+    )
+    print(f"[info] Separation mode: {separation_mode}")
+
+    print("[info] Acquiring subtitle segments")
+    segments, subtitle_metadata = acquire_segments(
+        input_video,
+        vocals_path,
+        workdir,
+        args.subtitle_source,
+        args.asr_model,
+        asr_device,
+        asr_compute_type,
+        args.chunk_seconds,
+        args.ocr_fps,
+        args.ocr_min_chars,
+        args.ocr_similarity,
+    )
+    print(f"[info] Subtitle source: {subtitle_metadata['source_name']}")
+    print(f"[info] Prepared {len(segments)} segments")
+
+    translation_backend = build_translation_backend(
+        args.target_language,
+        args.translation_provider,
+        args.hy_model,
+        args.hy_device,
+        args.hy_max_new_tokens,
+    )
+    translation_metadata = translation_backend_metadata(translation_backend)
+
+    if subtitle_metadata["needs_translation"]:
+        print("[info] Translating subtitle text")
+        translation_backend = translate_missing_segments(
+            segments,
+            args.target_language,
+            args.translation_provider,
+            args.translate_retries,
+            args.translate_batch_size,
+            args.translate_timeout,
+            args.hy_model,
+            args.hy_device,
+            args.hy_max_new_tokens,
+        )
+        translation_metadata = translation_backend_metadata(translation_backend, resolve_runtime=True)
+    else:
+        for segment in segments:
+            segment.translated_text = segment.source_text
+    source_srt = write_srt(segments, workdir / "source.srt", "source_text")
+    translated_srt = write_srt(segments, workdir / "translated.srt", "translated_text")
+    print("[info] Synthesizing dubbed speech")
+    dub_track, tts_backends = synthesize_segments(
+        segments,
+        args.voice,
+        total_duration,
+        workdir,
+        args.tts_timeout,
+        args.tts_retries,
+        args.edge_rate,
+        args.edge_pitch,
+        args.edge_volume,
+    )
+    print("[info] Mixing dubbed speech back into the video")
+    mix_audio(
+        input_video,
+        background_track,
+        dub_track,
+        output_video,
+        background_volume=args.background_volume,
+        dub_volume=args.dub_volume,
+    )
+
+    manifest = save_manifest(
+        segments,
+        workdir,
+        {
+            "input_video": str(input_video),
+            "output_video": str(output_video),
+            "target_language": args.target_language,
+            "voice": args.voice,
+            "tts_provider": "edge",
+            "translation_provider": args.translation_provider,
+            "resolved_translation_provider": translation_metadata["resolved_translation_provider"],
+            "translation_model": translation_metadata["translation_model"],
+            "resolved_translation_device": translation_metadata["resolved_translation_device"],
+            "subtitle_source": args.subtitle_source,
+            "resolved_subtitle_source": subtitle_metadata["source_name"],
+            "subtitle_language": subtitle_metadata["subtitle_language"],
+            "translation_skipped": not subtitle_metadata["needs_translation"],
+            "asr_model": args.asr_model,
+            "asr_device": args.asr_device,
+            "resolved_asr_device": asr_device,
+            "asr_compute_type": asr_compute_type,
+            "ocr_fps": args.ocr_fps,
+            "ocr_min_chars": args.ocr_min_chars,
+            "ocr_similarity": args.ocr_similarity,
+            "chunk_seconds": args.chunk_seconds,
+            "separation_mode": separation_mode,
+            "demucs_device": args.demucs_device,
+            "resolved_demucs_device": demucs_device,
+            "tts_backends": sorted(set(tts_backends)),
+            "tts_timeout": args.tts_timeout,
+            "tts_retries": args.tts_retries,
+            "translate_retries": args.translate_retries,
+            "translate_batch_size": args.translate_batch_size,
+            "translate_timeout": args.translate_timeout,
+                "hy_model": args.hy_model,
+                "hy_device": args.hy_device,
+                "hy_max_new_tokens": args.hy_max_new_tokens,
+            "background_volume": args.background_volume,
+            "dub_volume": args.dub_volume,
+            "edge_rate": args.edge_rate,
+            "edge_pitch": args.edge_pitch,
+            "edge_volume": args.edge_volume,
+            "source_srt": str(source_srt),
+            "translated_srt": str(translated_srt),
+            "ocr_source_srt": str(subtitle_metadata["raw_source_srt"]) if subtitle_metadata["raw_source_srt"] else None,
+            "ocr_secondary_srt": str(subtitle_metadata["raw_secondary_srt"]) if subtitle_metadata["raw_secondary_srt"] else None,
+            "ocr_debug_json": str(subtitle_metadata["ocr_debug_json"]) if subtitle_metadata.get("ocr_debug_json") else None,
+        },
+    )
+    print(f"[info] Manifest written to {manifest}")
+    print(f"[info] Output video written to {output_video}")
+
+
+def process_single_video(args: argparse.Namespace, input_video: Path, output_video: Path, workdir_root: Path | None = None) -> None:
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    if workdir_root is None:
+        temp_dir = tempfile.TemporaryDirectory(prefix="video_translator_")
+        workdir = Path(temp_dir.name)
+    else:
+        workdir = ensure_dir(workdir_root)
+
+    try:
+        run_translation(args, input_video, output_video, workdir)
+    except Exception as exc:
+        failure_log = write_failure_log(workdir, exc)
+        print(f"[error] Failed processing {input_video}: {exc}")
+        print(f"[error] Full traceback written to {failure_log}")
+        raise
+    finally:
+        if temp_dir is not None and not args.keep_workdir:
+            temp_dir.cleanup()
+
+
+def process_batch(args: argparse.Namespace, input_dir: Path) -> None:
+    videos = collect_input_videos(input_dir)
+    output_dir = resolve_batch_output_dir(input_dir, args.output)
+    print(f"[info] Found {len(videos)} video(s) in {input_dir}")
+    print(f"[info] Batch output directory: {output_dir}")
+
+    failures: list[tuple[Path, Exception]] = []
+    for index, video_path in enumerate(videos, start=1):
+        output_video = output_dir / default_output_path(video_path, args.target_language).name
+        workdir_root = None
+        if args.workdir is not None:
+            workdir_root = args.workdir.resolve() / video_path.stem
+
+        print(f"[info] [{index}/{len(videos)}] Processing {video_path.name}")
+        try:
+            process_single_video(args, video_path.resolve(), output_video.resolve(), workdir_root)
+        except Exception as exc:
+            failures.append((video_path, exc))
+
+    if failures:
+        failed_names = ", ".join(path.name for path, _ in failures)
+        raise RuntimeError(f"Batch completed with {len(failures)} failure(s): {failed_names}")
+
+
 def write_failure_log(workdir: Path, exc: Exception) -> Path:
     log_path = workdir / "error.log"
     log_path.write_text(traceback.format_exc(), encoding="utf-8")
@@ -1001,140 +1474,22 @@ def main() -> None:
     args = parse_args()
     require_binary("ffmpeg")
     require_binary("ffprobe")
-    asr_device, asr_compute_type = resolve_asr_runtime(args.asr_device, args.asr_compute_type)
-    demucs_device = resolve_demucs_device(args.demucs_device)
+    if args.input_dir is not None:
+        input_dir = args.input_dir.resolve()
+        if not input_dir.exists():
+            raise FileNotFoundError(f"Input directory not found: {input_dir}")
+        if not input_dir.is_dir():
+            raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
+        process_batch(args, input_dir)
+        return
 
     input_video = args.input_video.resolve()
     if not input_video.exists():
         raise FileNotFoundError(f"Input video not found: {input_video}")
 
     output_video = (args.output or default_output_path(input_video, args.target_language)).resolve()
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
-    if args.workdir is None:
-        temp_dir = tempfile.TemporaryDirectory(prefix="video_translator_")
-        workdir = Path(temp_dir.name)
-    else:
-        workdir = ensure_dir(args.workdir.resolve())
-
-    print(f"[info] Working directory: {workdir}")
-    total_duration = ffprobe_duration(input_video)
-    print(f"[info] Video duration: {total_duration:.1f}s")
-    print(f"[info] ASR runtime: device={asr_device}, compute_type={asr_compute_type}")
-    print(f"[info] Demucs runtime: device={demucs_device}")
-
-    try:
-        print("[info] Extracting source audio")
-        full_mix, speech_mix = extract_audio(input_video, workdir)
-        print("[info] Separating vocals and background")
-        vocals_path, background_track, separation_mode = separate_audio(
-            args.separator,
-            speech_mix,
-            full_mix,
-            workdir,
-            demucs_device,
-        )
-        print(f"[info] Separation mode: {separation_mode}")
-
-        print("[info] Acquiring subtitle segments")
-        segments, subtitle_metadata = acquire_segments(
-            input_video,
-            vocals_path,
-            workdir,
-            args.subtitle_source,
-            args.asr_model,
-            asr_device,
-            asr_compute_type,
-            args.chunk_seconds,
-            args.ocr_fps,
-            args.ocr_min_chars,
-            args.ocr_similarity,
-        )
-        print(f"[info] Subtitle source: {subtitle_metadata['source_name']}")
-        print(f"[info] Prepared {len(segments)} segments")
-
-        if subtitle_metadata["needs_translation"]:
-            print("[info] Translating subtitle text")
-            translate_missing_segments(segments, args.target_language, args.translate_retries, args.translate_batch_size, args.translate_timeout)
-        else:
-            for segment in segments:
-                segment.translated_text = segment.source_text
-        source_srt = write_srt(segments, workdir / "source.srt", "source_text")
-        translated_srt = write_srt(segments, workdir / "translated.srt", "translated_text")
-        print("[info] Synthesizing dubbed speech")
-        dub_track, tts_backends = synthesize_segments(
-            segments,
-            args.voice,
-            total_duration,
-            workdir,
-            args.tts_timeout,
-            args.tts_retries,
-            args.edge_rate,
-            args.edge_pitch,
-            args.edge_volume,
-        )
-        print("[info] Mixing dubbed speech back into the video")
-        mix_audio(
-            input_video,
-            background_track,
-            dub_track,
-            output_video,
-            background_volume=args.background_volume,
-            dub_volume=args.dub_volume,
-        )
-
-        manifest = save_manifest(
-            segments,
-            workdir,
-            {
-                "input_video": str(input_video),
-                "output_video": str(output_video),
-                "target_language": args.target_language,
-                "voice": args.voice,
-                "tts_provider": "edge",
-                "subtitle_source": args.subtitle_source,
-                "resolved_subtitle_source": subtitle_metadata["source_name"],
-                "subtitle_language": subtitle_metadata["subtitle_language"],
-                "translation_skipped": not subtitle_metadata["needs_translation"],
-                "asr_model": args.asr_model,
-                "asr_device": args.asr_device,
-                "resolved_asr_device": asr_device,
-                "asr_compute_type": asr_compute_type,
-                "ocr_fps": args.ocr_fps,
-                "ocr_min_chars": args.ocr_min_chars,
-                "ocr_similarity": args.ocr_similarity,
-                "chunk_seconds": args.chunk_seconds,
-                "separation_mode": separation_mode,
-                "demucs_device": args.demucs_device,
-                "resolved_demucs_device": demucs_device,
-                "tts_backends": sorted(set(tts_backends)),
-                "tts_timeout": args.tts_timeout,
-                "tts_retries": args.tts_retries,
-                "translate_retries": args.translate_retries,
-                "translate_batch_size": args.translate_batch_size,
-                "translate_timeout": args.translate_timeout,
-                "background_volume": args.background_volume,
-                "dub_volume": args.dub_volume,
-                "edge_rate": args.edge_rate,
-                "edge_pitch": args.edge_pitch,
-                "edge_volume": args.edge_volume,
-                "source_srt": str(source_srt),
-                "translated_srt": str(translated_srt),
-                "ocr_source_srt": str(subtitle_metadata["raw_source_srt"]) if subtitle_metadata["raw_source_srt"] else None,
-                "ocr_secondary_srt": str(subtitle_metadata["raw_secondary_srt"]) if subtitle_metadata["raw_secondary_srt"] else None,
-                "ocr_debug_json": str(subtitle_metadata["ocr_debug_json"]) if subtitle_metadata.get("ocr_debug_json") else None,
-            },
-        )
-        print(f"[info] Manifest written to {manifest}")
-        print(f"[info] Source subtitles written to {source_srt}")
-        print(f"[info] Translated subtitles written to {translated_srt}")
-        print(f"[info] Output video written to {output_video}")
-    except Exception as exc:
-        log_path = write_failure_log(workdir, exc)
-        print(f"[error] Pipeline failed. Details written to {log_path}", file=sys.stderr)
-        raise
-    finally:
-        if temp_dir is not None and not args.keep_workdir:
-            temp_dir.cleanup()
+    workdir_root = args.workdir.resolve() if args.workdir is not None else None
+    process_single_video(args, input_video, output_video, workdir_root)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@
 - 优先提取烧录字幕，并做简单过滤，剔除片头片尾 title card 和明显非对白字幕
 - 优先使用 Demucs 做人声分离，失败时自动降级到 ffmpeg 方案
 - 使用 faster-whisper 做本地语音识别
-- 使用 Google Translate 免费通道翻译文本
+- 默认使用本地腾讯混元 HY-MT1.5-1.8B 翻译模型，显式指定时才使用 Google Translate
 - 使用 Edge TTS 合成中文配音
 - 将新配音与背景声重新混合并封装回视频
 - 按固定时长分块识别，降低长视频处理的内存压力
@@ -84,8 +84,16 @@ pip install -r requirements.txt
 ## 用法
 
 ```bash
-video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-XiaoyiNeural --keep-workdir
+video-translator --video ./video_test.mov --target-language zh-CN --keep-workdir
 ```
+
+批量处理整个目录：
+
+```bash
+video-translator --input-dir ./videos --keep-workdir
+```
+
+批量模式下，程序会自动扫描目录内常见视频格式文件，并在输入目录下创建 `translated_videos/` 子目录保存生成结果。也可以通过 `--output ./my_outputs` 指定另一个输出目录。
 
 OCR 提取工具也会一起安装：
 
@@ -97,11 +105,15 @@ ocr-subtitles ./video_test.mov --fps 1.0 --output ./video_test.ocr.srt
 
 - `--separator auto|demucs|ffmpeg|none`：选择分离策略
 - `--video path/to/video.mov`：指定输入视频路径，推荐作为标准调用方式
+- `--input-dir path/to/videos`：批量处理目录中的所有视频文件
 - `--chunk-seconds 300`：按 300 秒分块转录
 - `--subtitle-source auto|ocr|asr`：默认优先 OCR，失败时回退 ASR
+- `--translation-provider hy-local|google`：默认使用本地 HY-MT，只有显式传 `google` 时才走 Google Translate
 - `--ocr-fps 1.0`：OCR 每秒抽帧数，越高越细，越慢
 - `--asr-model small`：切换 faster-whisper 模型大小
 - `--output output.mov`：指定输出文件
+- `--output output_dir/`：批量模式下指定输出目录
+- `--hy-device auto|mps|cpu|cuda`：指定本地 HY-MT 的运行设备，默认自动选择
 - `--keep-workdir`：保留中间文件，方便人工检查和复跑
 - `--edge-rate -5%`：调整 Edge TTS 语速
 - `--edge-pitch -12Hz`：调整 Edge TTS 音高，缓解偏尖的感觉
@@ -110,14 +122,26 @@ ocr-subtitles ./video_test.mov --fps 1.0 --output ./video_test.ocr.srt
 
 推荐中文 Edge 音色：
 
-- `zh-CN-XiaoyiNeural`：默认，整体比 `Xiaoxiao` 更柔和一些
+- `zh-CN-YunjianNeural`：默认，男声，存在感更强
+- `zh-CN-XiaoyiNeural`：整体比 `Xiaoxiao` 更柔和一些
 - `zh-CN-YunyangNeural`：偏男声，纪录片类旁白通常更稳
-- `zh-CN-YunjianNeural`：男声，存在感更强
 
 如果觉得声音偏尖、偏快，建议先试：
 
 ```bash
-video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-XiaoyiNeural --edge-pitch -12Hz --edge-rate -5% --separator ffmpeg --keep-workdir
+video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-YunjianNeural --edge-pitch -12Hz --edge-rate -5% --separator ffmpeg --keep-workdir
+```
+
+## 翻译后端
+
+默认翻译后端是本地 `tencent/HY-MT1.5-1.8B`。程序会优先尝试更省资源的量化版本，但在当前这类 macOS `mps` / `cpu` 环境下，量化仓库通常不可直接运行，因此会自动回退到基础模型；如果在支持 CUDA 的环境运行，会优先尝试 `HY-MT1.5-1.8B-GPTQ-Int4`。
+
+首次使用本地翻译时会从 Hugging Face 下载模型，耗时会明显长于后续运行。
+
+如果你仍然想强制使用 Google Translate，可以显式传：
+
+```bash
+video-translator --video ./video_test.mov --translation-provider google
 ```
 
 ## 开发与版本管理
