@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "video-translator-cli"
 dynamic = ["version"]
-description = "OCR-first video translation and dubbing CLI built on ffmpeg, Whisper, Edge TTS, and RapidOCR"
+description = "Offline OCR-first video translation and GPT-SoVITS dubbing CLI built on ffmpeg, Whisper, HY-MT, and RapidOCR"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -30,9 +30,8 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "deep-translator",
+  "audio-separator[cpu]==0.44.1",
   "demucs",
-  "edge-tts",
   "faster-whisper",
   "rapidocr-onnxruntime",
   "requests",

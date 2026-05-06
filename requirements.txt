@@ -1,7 +1,6 @@
 faster-whisper
-deep-translator
 transformers==4.56.0
-edge-tts
+audio-separator[cpu]==0.44.1
 demucs
 rapidocr-onnxruntime
 requests

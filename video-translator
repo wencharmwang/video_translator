@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_CONFIG_PATH="$ROOT_DIR/gpt_sovits.local.json"
+
+if [[ ! -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  echo "[run] Missing local environment. Run ./install.sh first."
+  exit 1
+fi
+
+read_service_url() {
+  "$ROOT_DIR/.venv/bin/python" - <<PY
+import json
+from pathlib import Path
+config_path = Path("$SERVICE_CONFIG_PATH")
+if not config_path.is_file():
+    print("http://127.0.0.1:9880")
+else:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    print(config.get("url", "http://127.0.0.1:9880"))
+PY
+}
+
+if [[ "$#" -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
+  exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/video_translator.py" "$@"
+fi
+
+if [[ -f "$SERVICE_CONFIG_PATH" ]]; then
+  SERVICE_URL="$(read_service_url)"
+  if ! curl -sS -m 3 "$SERVICE_URL/" >/dev/null 2>&1; then
+    "$ROOT_DIR/start-gpt-sovits.sh"
+  fi
+fi
+
+exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/video_translator.py" "$@"

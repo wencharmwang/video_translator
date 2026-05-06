@@ -1,212 +1,282 @@
 # Video Translator
 
-`video_translator` 是一个面向本地运行的命令行视频翻译工具，重点解决“已有字幕的视频快速转中文配音”这类场景。
+`video_translator` 是一个纯离线的视频翻译与中文配音命令行工具，面向“本地完成字幕提取、翻译、配音和混音”的工作流。
 
-它采用 OCR-first 流程：优先提取烧录字幕；如果视频里已经有中文字幕，直接保留中文进入 TTS；如果只有英文字幕，则先翻译后配音；如果没有可用字幕，再自动回退到 ASR。
+默认面向两类用户：
 
-## Highlights
+- 普通用户：安装一次后，只传一个视频路径
+- 进阶用户：按需覆盖字幕、分离、翻译、配音和混音参数
 
-- OCR-first 字幕获取，适合纪录片、访谈、解说类视频
-- 中文字幕直通配音，避免重复翻译带来的误差
-- 英文字幕自动翻译，OCR 失败时自动回退到 faster-whisper
-- Edge TTS 配音，支持语速、音高、音量调节
-- 输出 `source.srt`、`translated.srt`、`manifest.json` 便于排查和复跑
-- 保留背景音并重新混音，尽量维持原视频氛围
+当前产品只保留两条核心能力：
 
-## 功能
+- 本地 `HY-MT` 翻译
+- 本地 `GPT-SoVITS` 配音
 
-- 从视频中抽取音频
-- 优先提取烧录字幕，并做简单过滤，剔除片头片尾 title card 和明显非对白字幕
-- 优先使用 Demucs 做人声分离，失败时自动降级到 ffmpeg 方案
-- 使用 faster-whisper 做本地语音识别
-- 默认使用本地腾讯混元 HY-MT1.5-1.8B 翻译模型，显式指定时才使用 Google Translate
-- 使用 Edge TTS 合成中文配音
-- 将新配音与背景声重新混合并封装回视频
-- 按固定时长分块识别，降低长视频处理的内存压力
-- 导出 `source.srt` 和 `translated.srt`，便于人工检查字幕边界与时间轴
+产品目标是不依赖 Google Translate、Edge TTS 或其他在线 SaaS 能力；运行时不主动访问公网翻译或公网 TTS 服务。
+
+## 特性
+
+- OCR-first 字幕获取：优先内嵌字幕，其次 OCR，最后回退 ASR
+- 全链路本地运行：翻译使用本地 `HY-MT`，配音使用本地 `GPT-SoVITS` HTTP API
+- 支持 `MDX-Net`、`Demucs`、`ffmpeg` 多种分离策略
+- 自动保留背景声并重新混音
+- 输出 `source.srt`、`translated.srt`、`manifest.json`、`audio_audit.log`
+- 对异常偏静的 TTS 片段自动重试 2 次
+
+## 当前架构
+
+- 字幕获取：内嵌字幕提取 -> OCR -> ASR 回退
+- 翻译：本地 `tencent/HY-MT1.5-1.8B`
+- 配音：本地 `GPT-SoVITS` API
+- 混音：`ffmpeg` 将背景轨与配音轨重新封装回原视频
+
+更完整的架构说明见 [DESIGN.MD](./DESIGN.MD)。
+
+## 快速开始
+
+对普通用户，推荐流程只有两步。
+
+### 第一步：执行一键安装
+
+```bash
+./install.sh
+```
+
+安装脚本会处理以下事情：
+
+- 创建本地虚拟环境 `.venv`
+- 安装 Python 依赖
+- 安装当前项目
+- 检查 `ffmpeg` 和 `ffprobe`
+- 自动执行 `./init.sh`
+
+初始化脚本会继续处理：
+
+- 自动检测已有 `GPT-SoVITS` 服务仓库
+- 若本机没有仓库，默认克隆到同级目录 `../GPT-SoVITS`
+- 准备或复用 `GPT-SoVITS` 的 Python 环境
+- 预下载本地翻译、ASR、MDX、Demucs 所需模型
+- 把这些运行时模型统一缓存到 `.video-translator/models/`
+- 通过和运行时一致的 `transformers` 加载路径预热 `HY-MT` 完整权重，避免首次翻译时再下载大体积 checkpoint
+- 准备自动音色克隆所需的默认参考配置
+- 生成 `video_translator.defaults.json` 运行默认配置
+- 生成 `gpt_sovits.local.json` 本地服务配置
+- 启动本地 `GPT-SoVITS` 服务
+
+如果你只想先装主程序、不初始化服务，也可以：
+
+```bash
+./install.sh --skip-init
+./init.sh
+```
+
+### 第二步：只传入视频路径
+
+```bash
+./video-translator /path/to/video.mov
+```
+
+如果你更喜欢直接调用虚拟环境里的 CLI，也可以：
+
+```bash
+./.venv/bin/video-translator /path/to/video.mov
+```
+
+安装脚本生成的默认配置会自动提供：
+
+- 目标语言：中文
+- GPT-SoVITS 本地地址
+- 自动单旁白音色克隆模式
+- 保守回退男声/女声参考音频路径
+
+默认简单模式下，程序会优先从当前输入视频里自动挑选一段较干净的单旁白原声音频，并直接用该片段的原文做 GPT-SoVITS 参考文本。
+
+如果自动抽取失败，程序会进入保守模式：
+
+- 优先按检测到的说话人音高，在 `male.wav` 和 `female.mp3` 之间选择更接近的一条中文参考音频
+- 若这两个文件缺失或转写失败，再回退到仓库内置的固定参考音频
 
 ## 环境准备
 
-- 系统安装 ffmpeg 和 ffprobe
-- 建议使用 Python 3.10+
+- Python `3.10+`
+- 首次安装阶段需要可访问对应模型源，用于下载本地翻译、ASR 与分离模型
 
-## 安装
+`install.sh` 和 `init.sh` 会尽可能处理本地环境；在 macOS 且已安装 Homebrew 的情况下，它们会自动补齐 `ffmpeg`，并在缺失时安装 `python@3.11` 供 `GPT-SoVITS` 使用。
 
-推荐安装方式：使用 `pipx` 安装 CLI：
+## GPT-SoVITS 前置条件
 
-```bash
-pipx install video-translator-cli
+本仓库不把 `GPT-SoVITS` 推理代码直接 vendor 进当前仓库，但现在会在 `init.sh` 中自动检测或克隆官方仓库，并把服务启动准备好。默认 HTTP 地址仍然是：
+
+```text
+http://127.0.0.1:9880
 ```
 
-如果本机还没有 `pipx`，请先按你所用系统的官方方式安装 `pipx`，再执行上面的命令。
+对于普通用户，这三项默认由 `init.sh` 生成并写入 `video_translator.defaults.json`；只有进阶用户才需要手动覆盖：
 
-如果你更习惯使用虚拟环境，也可以这样安装：
+- 一段参考音频 `--gpt-sovits-ref-audio`
+- 该参考音频对应的文本 `--gpt-sovits-prompt-text`
+- 参考音频语言 `--gpt-sovits-prompt-lang`
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install video-translator-cli
-```
+如果你要启用保守模式里的男女回退参考，请把你准备好的两个文件放在项目根目录：
 
-如果你看到 `externally-managed-environment`，说明当前 Python 由系统包管理器接管，不能直接往系统环境里执行 `pip install`。此时请改用上面的 `pipx` 或 `venv` 方案，不建议直接使用 `--break-system-packages`。
-
-从 PyPI 安装到当前已激活的虚拟环境：
-
-```bash
-pip install video-translator-cli
-```
-
-从当前仓库安装：
-
-```bash
-pip install .
-```
-
-本地开发安装：
-
-```bash
-pip install -e .
-```
-
-直接从 GitHub 安装：
-
-```bash
-pip install git+ssh://git@github.com/wencharmwang/video_translator.git
-```
-
-如果只想按旧方式装运行依赖，也可以继续使用：
-
-```bash
-pip install -r requirements.txt
-```
+- `./female.mp3`
+- `./male.wav`
 
 ## 用法
 
-```bash
-video-translator --video ./video_test.mov --target-language zh-CN --keep-workdir
-```
+### 小白模式
 
-批量处理整个目录：
+安装完成后，最简单的单文件用法是：
 
 ```bash
-video-translator --input-dir ./videos --keep-workdir
+./video-translator ./video_test.mov
 ```
 
-批量模式下，程序会自动扫描目录内常见视频格式文件，并在输入目录下创建 `translated_videos/` 子目录保存生成结果。也可以通过 `--output ./my_outputs` 指定另一个输出目录。
-
-OCR 提取工具也会一起安装：
+也支持直接把视频路径作为唯一参数传给 CLI：
 
 ```bash
-ocr-subtitles ./video_test.mov --fps 1.0 --output ./video_test.ocr.srt
+./.venv/bin/video-translator ./video_test.mov
 ```
 
-常用参数：
+在这个模式下，不需要手动指定参考音频。程序会优先尝试“原视频单旁白音色 -> 中文配音”，只有在自动抽取失败时才回退到 `female.mp3` / `male.wav` 或仓库内置参考音色。
 
-- `--separator auto|demucs|ffmpeg|none`：选择分离策略
-- `--video path/to/video.mov`：指定输入视频路径，推荐作为标准调用方式
-- `--input-dir path/to/videos`：批量处理目录中的所有视频文件
-- `--chunk-seconds 300`：按 300 秒分块转录
-- `--subtitle-source auto|ocr|asr`：默认优先 OCR，失败时回退 ASR
-- `--translation-provider hy-local|google`：默认使用本地 HY-MT，只有显式传 `google` 时才走 Google Translate
-- `--ocr-fps 1.0`：OCR 每秒抽帧数，越高越细，越慢
-- `--asr-model small`：切换 faster-whisper 模型大小
-- `--output output.mov`：指定输出文件
-- `--output output_dir/`：批量模式下指定输出目录
-- `--hy-device auto|mps|cpu|cuda`：指定本地 HY-MT 的运行设备，默认自动选择
-- `--keep-workdir`：保留中间文件，方便人工检查和复跑
-- `--edge-rate -5%`：调整 Edge TTS 语速
-- `--edge-pitch -12Hz`：调整 Edge TTS 音高，缓解偏尖的感觉
-- `--edge-volume +0%`：调整 Edge TTS 音量
-- `--translate-timeout 30`：限制单次翻译 HTTP 请求超时，避免长时间挂住
+### 进阶模式
 
-推荐中文 Edge 音色：
+当你想替换默认参考音频或其他行为时，再显式传参数。
 
-- `zh-CN-YunjianNeural`：默认，男声，存在感更强
-- `zh-CN-XiaoyiNeural`：整体比 `Xiaoxiao` 更柔和一些
-- `zh-CN-YunyangNeural`：偏男声，纪录片类旁白通常更稳
-
-如果觉得声音偏尖、偏快，建议先试：
+最小单文件显式参数示例：
 
 ```bash
-video-translator --video ./video_test.mov --target-language zh-CN --voice zh-CN-YunjianNeural --edge-pitch -12Hz --edge-rate -5% --separator ffmpeg --keep-workdir
+video-translator \
+	--video ./video_test.mov \
+	--gpt-sovits-ref-audio ./ref_voice.wav \
+	--gpt-sovits-prompt-lang zh \
+	--gpt-sovits-prompt-text "这是参考音频对应的文本" \
+	--keep-workdir
 ```
 
-## 翻译后端
-
-默认翻译后端是本地 `tencent/HY-MT1.5-1.8B`。程序会优先尝试更省资源的量化版本，但在当前这类 macOS `mps` / `cpu` 环境下，量化仓库通常不可直接运行，因此会自动回退到基础模型；如果在支持 CUDA 的环境运行，会优先尝试 `HY-MT1.5-1.8B-GPTQ-Int4`。
-
-首次使用本地翻译时会从 Hugging Face 下载模型，耗时会明显长于后续运行。
-
-如果你仍然想强制使用 Google Translate，可以显式传：
+批量处理目录：
 
 ```bash
-video-translator --video ./video_test.mov --translation-provider google
+video-translator \
+	--input-dir ./videos \
+	--gpt-sovits-ref-audio ./ref_voice.wav \
+	--gpt-sovits-prompt-lang zh \
+	--gpt-sovits-prompt-text "这是参考音频对应的文本" \
+	--keep-workdir
 ```
 
-## 开发与版本管理
+批量模式默认输出到输入目录下的 `translated_videos/`。
 
-- 版本号单一来源：`video_translator.__version__`
-- 变更记录：`CHANGELOG.md`
-- 发布建议遵循 Semantic Versioning
+## 常用参数
 
-推荐发布流程：
+普通用户通常只需要：
+
+- `video-translator /path/to/video.mov`
+
+只有在需要自定义时，再使用下面这些参数：
+
+- `--video path/to/video.mov`：处理单个视频
+- `--input-dir path/to/videos`：批量处理目录
+- `--output output.mov`：指定单文件输出路径
+- `--output output_dir/`：批量模式指定输出目录
+- `--workdir path/to/workdir`：指定中间产物目录
+- `--keep-workdir`：保留中间文件，方便复查
+- `--subtitle-source auto|ocr|asr`：字幕来源策略
+- `--separator auto|mdx|demucs|ffmpeg|none`：分离策略
+- `--mdx-model UVR_MDXNET_KARA_2.onnx`：指定 MDX 模型
+- `--asr-model tiny|small|medium|large-v3`：ASR 模型大小
+- `--chunk-seconds 300`：长视频 ASR 分块时长
+- `--ocr-fps 1.0`：OCR 抽帧频率
+- `--hy-device auto|cpu|mps|cuda`：HY-MT 运行设备
+- `--hy-model tencent/HY-MT1.5-1.8B`：HY-MT 模型 ID
+- `--gpt-sovits-url http://127.0.0.1:9880`：本地 GPT-SoVITS API
+- `--gpt-sovits-ref-audio ./ref.wav`：参考音频
+- `--gpt-sovits-prompt-lang zh`：参考音频语言
+- `--gpt-sovits-prompt-text "..."`：参考音频对应文本
+- `--gpt-sovits-text-lang zh`：目标文本语言
+- `--gpt-sovits-text-split-method cut5`：GPT-SoVITS 切句策略
+- `--gpt-sovits-speed 1.0`：GPT-SoVITS 基础语速
+- `--dub-volume 0.78`：配音混音权重
+- `--background-volume 1.18`：背景混音权重
+
+## 示例
+
+### 最简单示例
 
 ```bash
-python -m pip install --upgrade build twine
-python -m build
-python -m twine check dist/*
-git tag -a v0.1.4 -m "Release v0.1.4"
-git push origin main --tags
-python -m twine upload dist/*
+./install.sh
+./video-translator ./samples/video_test_5.mov
 ```
 
-如果已经在 GitHub 建好仓库，可以基于 `v0.1.4` tag 创建 GitHub Release，并把 `dist/` 里的 wheel 和 sdist 作为 release assets 上传。
+### 显式指定参考音频
 
-构建发布产物：
+使用中文参考音频生成中文配音：
 
 ```bash
-python -m pip install --upgrade build twine
-python -m build
-python -m twine check dist/*
-python -m twine upload dist/*
+video-translator \
+	--video ./samples/video_test_5.mov \
+	--output ./samples/video_test_5_gpt_sovits.mov \
+	--workdir ./artifacts/gpt_sovits_video_test_5 \
+	--keep-workdir \
+	--separator mdx \
+	--gpt-sovits-url http://127.0.0.1:9880 \
+	--gpt-sovits-ref-audio ./artifacts/gpt_sovits_ref.wav \
+	--gpt-sovits-prompt-lang zh \
+	--gpt-sovits-prompt-text "这是参考音频对应的文本" \
+	--gpt-sovits-text-lang zh
 ```
 
-发布前建议至少做下面三项检查：
+使用已有中文成片中的旁白抽取参考音频后再克隆：
 
-- `video-translator --help`
-- `ocr-subtitles --help`
-- `python -m build`
+```bash
+ffmpeg -y -ss 16.3 -to 26.3 -i ./samples/translated_videos/video_test_5_zh_CN.mov -vn -ac 1 -ar 32000 ./artifacts/ref_from_translated_video.wav
 
-## 仓库内容
+video-translator \
+	--video ./samples/video_test_5.mov \
+	--gpt-sovits-ref-audio ./artifacts/ref_from_translated_video.wav \
+	--gpt-sovits-prompt-lang zh \
+	--gpt-sovits-prompt-text "毫无疑问，有史以来最杰出的动物之一，也是最为著名的生物之一，就是恐龙。" \
+	--gpt-sovits-text-lang zh \
+	--keep-workdir
+```
 
-- `video_translator.py`：主 CLI 入口和视频翻译主流程
-- `ocr_subtitles.py`：OCR 字幕提取 CLI 和复用逻辑
-- `pyproject.toml`：Python 包元数据与 console scripts
-- `CHANGELOG.md`：版本变更记录
-- `CONTRIBUTING.md`：开发与版本管理约定
+## 输出内容
 
-## 示例媒体
+每次运行会生成：
 
-仓库默认不提交大体积测试视频。
+- 最终配音视频
+- `source.srt`
+- `translated.srt`
+- `manifest.json`
+- `audio_audit.log`
+- `tts/`、`timeline/`、`ocr/` 等中间目录
 
-- 本地开发可以自行准备 `video_test.mov` 或其他样例素材
-- 如果需要对外提供演示素材，建议放到 GitHub Releases、对象存储或 Git LFS，而不是直接放进 Git 仓库历史
+其中 `audio_audit.log` 用于人工审核：
 
-## 输出
-
-- 翻译后的视频文件，例如 `video_test_zh_CN.mov`
-- 中间目录中的 `manifest.json`，记录识别、翻译和 TTS 结果
-- 中间目录中的 `source.srt` 和 `translated.srt`，分别保存原文字幕块和译文字幕块
-- 如果走 OCR，还会在工作目录的 `ocr/` 子目录下保留 OCR 字幕和调试信息
-- 任务失败时会在工作目录写入 `error.log`
+- 每段 TTS 是否生成
+- 原始音频和拟合后音频路径
+- 每段时长与音量指标
+- 是否命中 `very-quiet` 自动重试
+- 最终 `dub_track`、背景轨和输出视频时长
 
 ## 说明
 
-- Demucs 首次运行会下载模型，耗时较长。
-- `ffmpeg` 降级方案无法像 Demucs 那样干净地保留背景声，只作为兜底。
-- Edge TTS 和 Google Translate 依赖网络访问。
-- OCR 主流程适合已有烧录字幕的视频；如果 OCR 没抓到可用字幕，会自动回退到 ASR。
+- `video_translator.defaults.json` 是本地运行默认配置，主要用于“只传视频路径”的简化模式。
+- `gpt_sovits.local.json` 是本地 GPT-SoVITS 服务启动配置，由 `init.sh` 生成。
+- `.video-translator/models/` 是本地运行模型缓存目录，`init.sh` 会提前准备 `HY-MT`、`faster-whisper`、`MDX-Net`、`Demucs` 所需资产。
+- `GPT-SoVITS` 虽通过本地 HTTP API 调用，但服务应部署在本机或内网环境中。
+- `video-translator` 在检测到本地服务未启动时，会优先尝试自动拉起 `GPT-SoVITS`。
+- `ffmpeg` 降级方案的人声分离效果不如 `MDX-Net` 或 `Demucs`。
+
+## 仓库内容
+
+- `video_translator.py`：主 CLI 和视频翻译主流程
+- `ocr_subtitles.py`：OCR 字幕提取
+- `pyproject.toml`：包元数据
+- `requirements.txt`：运行依赖
+- `DESIGN.MD`：架构设计说明
+- `README.md`：用户使用说明
 
 ## License
 

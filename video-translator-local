@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  echo "[run] Missing local environment. Run ./install.sh first."
+  exit 1
+fi
+
+exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/video_translator.py" "$@"

@@ -3,35 +3,33 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import functools
 import json
+import math
 import re
 import requests
 import signal
 import shutil
-import socket
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Protocol
-
-import edge_tts
-from deep_translator import GoogleTranslator
 
 if TYPE_CHECKING:
     from ocr_subtitles import SubtitleBlock
 
 
 __version__ = "0.1.4"
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
-DEFAULT_TTS_VOICE = "zh-CN-YunjianNeural"
 DEFAULT_ASR_MODEL = "small"
 DEFAULT_CHUNK_SECONDS = 300
 DEFAULT_TTS_TIMEOUT = 60
@@ -40,9 +38,10 @@ DEFAULT_TRANSLATE_RETRIES = 3
 DEFAULT_TRANSLATE_BATCH_SIZE = 12
 DEFAULT_TRANSLATE_TIMEOUT = 30
 DEFAULT_TRANSLATION_PROVIDER = "hy-local"
-DEFAULT_EDGE_RATE = "+0%"
-DEFAULT_EDGE_PITCH = "+0Hz"
-DEFAULT_EDGE_VOLUME = "+0%"
+DEFAULT_GPT_SOVITS_URL = "http://127.0.0.1:9880"
+DEFAULT_GPT_SOVITS_TEXT_LANG = "auto"
+DEFAULT_GPT_SOVITS_TEXT_SPLIT_METHOD = "cut5"
+DEFAULT_GPT_SOVITS_SPEED = 1.0
 DEFAULT_ASR_DEVICE = "auto"
 DEFAULT_ASR_COMPUTE_TYPE = "default"
 DEFAULT_DEMUCS_DEVICE = "auto"
@@ -55,11 +54,25 @@ DEFAULT_HY_GPTQ_MODEL = "tencent/HY-MT1.5-1.8B-GPTQ-Int4"
 DEFAULT_HY_FP8_MODEL = "tencent/HY-MT1.5-1.8B-FP8"
 DEFAULT_HY_DEVICE = "auto"
 DEFAULT_HY_MAX_NEW_TOKENS = 256
+DEFAULT_MDX_MODEL = "UVR_MDXNET_KARA_2.onnx"
+DEFAULT_PROFILE_FILENAMES = ("video_translator.defaults.json", ".video_translator.defaults.json")
+DEFAULT_PROFILE_DIRNAME = ".video-translator"
+DEFAULT_PROFILE_BUNDLED_REF = PROJECT_ROOT / "artifacts" / "gpt_sovits_ref_from_translated_video.wav"
+DEFAULT_PROFILE_PROMPT_TEXT = "您好，很高兴能为您提供配音服务，选择您感兴趣的音色，让我们一起开启声音创作的奇幻之旅吧。"
+DEFAULT_PROFILE_PROMPT_LANG = "zh"
+DEFAULT_GPT_SOVITS_REF_MODE = "auto-single-speaker"
+DEFAULT_GPT_SOVITS_FALLBACK_FEMALE_REF = PROJECT_ROOT / "female.mp3"
+DEFAULT_GPT_SOVITS_FALLBACK_MALE_REF = PROJECT_ROOT / "male.wav"
+DEFAULT_RUNTIME_CACHE_DIR = PROJECT_ROOT / DEFAULT_PROFILE_DIRNAME / "models"
+GPT_SOVITS_LOCAL_CONFIG = PROJECT_ROOT / "gpt_sovits.local.json"
+GPT_SOVITS_START_SCRIPT = PROJECT_ROOT / "start-gpt-sovits.sh"
 DUB_SAMPLE_RATE = 44100
 DUB_CHANNELS = 1
 DEFAULT_BATCH_OUTPUT_DIRNAME = "translated_videos"
 MIN_AUDIO_FIT_RATIO = 0.92
 MAX_AUDIO_FIT_RATIO = 1.22
+QUIET_TTS_RETRIES = 2
+QUIET_TTS_RETRY_ISSUES = {"very-quiet", "mostly-silent"}
 SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？", "…")
 
 VIDEO_EXTENSIONS = {
@@ -123,6 +136,25 @@ class TranslationBackend:
     uses_network_timeout: bool
 
 
+@dataclass(frozen=True, slots=True)
+class GptSovitsConfig:
+    api_url: str
+    ref_audio_path: Path
+    prompt_text: str
+    prompt_lang: str
+    text_lang: str
+    text_split_method: str
+    speed_factor: float
+
+
+@dataclass(frozen=True, slots=True)
+class GptSovitsReferenceSelection:
+    config: GptSovitsConfig
+    source: str
+    detail: str
+    detected_pitch_hz: float | None = None
+
+
 @dataclass(slots=True)
 class HyMtRuntime:
     tokenizer: object
@@ -139,13 +171,99 @@ class SubtitleAcquisition(Protocol):
     raw_secondary_srt: Path | None
 
 
+@dataclass(slots=True)
+class SrtBlock:
+    start: float
+    end: float
+    text: str
+
+
+def runtime_default_config_paths() -> list[Path]:
+    return [
+        PROJECT_ROOT / name for name in DEFAULT_PROFILE_FILENAMES
+    ] + [Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME / "config.json"]
+
+
+def bundled_runtime_defaults() -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "target_language": DEFAULT_TARGET_LANGUAGE,
+        "gpt_sovits_url": DEFAULT_GPT_SOVITS_URL,
+        "gpt_sovits_ref_mode": DEFAULT_GPT_SOVITS_REF_MODE,
+        "gpt_sovits_prompt_lang": DEFAULT_PROFILE_PROMPT_LANG,
+        "gpt_sovits_prompt_text": DEFAULT_PROFILE_PROMPT_TEXT,
+        "gpt_sovits_fallback_female_audio": DEFAULT_GPT_SOVITS_FALLBACK_FEMALE_REF,
+        "gpt_sovits_fallback_male_audio": DEFAULT_GPT_SOVITS_FALLBACK_MALE_REF,
+    }
+    if DEFAULT_PROFILE_BUNDLED_REF.is_file():
+        defaults["gpt_sovits_ref_audio"] = DEFAULT_PROFILE_BUNDLED_REF
+    return defaults
+
+
+def load_runtime_defaults() -> tuple[dict[str, object], Path | None]:
+    defaults = bundled_runtime_defaults()
+    path_like_keys = {
+        "gpt_sovits_ref_audio",
+        "gpt_sovits_fallback_female_audio",
+        "gpt_sovits_fallback_male_audio",
+    }
+    for config_path in runtime_default_config_paths():
+        if not config_path.is_file():
+            continue
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Runtime defaults file must contain a JSON object: {config_path}")
+        for key, value in payload.items():
+            if key in path_like_keys and value:
+                candidate = Path(str(value)).expanduser()
+                if not candidate.is_absolute():
+                    candidate = (config_path.parent / candidate).resolve()
+                defaults[key] = candidate
+            else:
+                defaults[key] = value
+        return defaults, config_path
+    return defaults, None
+
+
+def apply_runtime_defaults(args: argparse.Namespace, raw_args: list[str]) -> tuple[argparse.Namespace, Path | None]:
+    defaults, source_path = load_runtime_defaults()
+    provided_flags = {arg for arg in raw_args if arg.startswith("--")}
+    args.gpt_sovits_reference_manual = any(
+        flag in provided_flags
+        for flag in ("--gpt-sovits-ref-audio", "--gpt-sovits-prompt-text", "--gpt-sovits-prompt-lang")
+    )
+    args.gpt_sovits_ref_mode = (
+        "manual"
+        if args.gpt_sovits_reference_manual
+        else str(defaults.get("gpt_sovits_ref_mode") or DEFAULT_GPT_SOVITS_REF_MODE)
+    )
+
+    if "--target-language" not in provided_flags and defaults.get("target_language"):
+        args.target_language = str(defaults["target_language"])
+    if "--gpt-sovits-url" not in provided_flags and defaults.get("gpt_sovits_url"):
+        args.gpt_sovits_url = str(defaults["gpt_sovits_url"])
+    if args.gpt_sovits_ref_audio is None and defaults.get("gpt_sovits_ref_audio"):
+        args.gpt_sovits_ref_audio = Path(str(defaults["gpt_sovits_ref_audio"]))
+    if not args.gpt_sovits_prompt_lang.strip() and defaults.get("gpt_sovits_prompt_lang"):
+        args.gpt_sovits_prompt_lang = str(defaults["gpt_sovits_prompt_lang"])
+    if not args.gpt_sovits_prompt_text.strip() and defaults.get("gpt_sovits_prompt_text"):
+        args.gpt_sovits_prompt_text = str(defaults["gpt_sovits_prompt_text"])
+    if "--gpt-sovits-text-lang" not in provided_flags and defaults.get("gpt_sovits_text_lang"):
+        args.gpt_sovits_text_lang = str(defaults["gpt_sovits_text_lang"])
+    if "--gpt-sovits-text-split-method" not in provided_flags and defaults.get("gpt_sovits_text_split_method"):
+        args.gpt_sovits_text_split_method = str(defaults["gpt_sovits_text_split_method"])
+    if "--gpt-sovits-speed" not in provided_flags and defaults.get("gpt_sovits_speed") is not None:
+        args.gpt_sovits_speed = float(defaults["gpt_sovits_speed"])
+    args.gpt_sovits_fallback_female_audio = defaults.get("gpt_sovits_fallback_female_audio")
+    args.gpt_sovits_fallback_male_audio = defaults.get("gpt_sovits_fallback_male_audio")
+    return args, source_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate a video into a target language and rebuild the dubbed video.")
     parser.add_argument("--video", type=Path, default=None, help="Path to the source video file")
     parser.add_argument("--input-dir", type=Path, default=None, help="Process all supported video files in a directory")
     parser.add_argument("--output", type=Path, default=None, help="Path to the translated output video")
     parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE, help="Target language for translation, e.g. zh-CN")
-    parser.add_argument("--voice", default=DEFAULT_TTS_VOICE, help="Edge TTS voice name")
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL, help="faster-whisper model size, e.g. small or medium")
     parser.add_argument(
         "--asr-device",
@@ -166,10 +284,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workdir", type=Path, default=None, help="Directory for intermediate files")
     parser.add_argument(
         "--separator",
-        choices=("auto", "demucs", "ffmpeg", "none"),
+        choices=("auto", "mdx", "demucs", "ffmpeg", "none"),
         default="auto",
         help="Voice/background separation strategy",
     )
+    parser.add_argument("--mdx-model", default=DEFAULT_MDX_MODEL, help="MDX-Net/UVR model filename for offline vocal separation")
     parser.add_argument(
         "--demucs-device",
         choices=("auto", "cpu", "cuda", "mps"),
@@ -179,17 +298,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-workdir", action="store_true", help="Keep intermediate artifacts")
     parser.add_argument("--dub-volume", type=float, default=0.78, help="Mix weight for synthesized speech")
     parser.add_argument("--background-volume", type=float, default=1.18, help="Mix weight for background audio")
-    parser.add_argument("--tts-timeout", type=int, default=DEFAULT_TTS_TIMEOUT, help="Per-request timeout in seconds for Edge TTS")
-    parser.add_argument("--tts-retries", type=int, default=DEFAULT_TTS_RETRIES, help="Retry count before falling back to local TTS")
-    parser.add_argument(
-        "--translation-provider",
-        choices=("hy-local", "google"),
-        default=DEFAULT_TRANSLATION_PROVIDER,
-        help="Translation backend. hy-local uses the local Tencent HY-MT model by default; google uses Google Translate explicitly.",
-    )
+    parser.add_argument("--tts-timeout", type=int, default=DEFAULT_TTS_TIMEOUT, help="Per-request timeout in seconds for GPT-SoVITS")
+    parser.add_argument("--tts-retries", type=int, default=DEFAULT_TTS_RETRIES, help="Retry count for GPT-SoVITS request failures")
     parser.add_argument("--translate-retries", type=int, default=DEFAULT_TRANSLATE_RETRIES, help="Retry count for the selected translation backend")
     parser.add_argument("--translate-batch-size", type=int, default=DEFAULT_TRANSLATE_BATCH_SIZE, help="Number of segments to send in each batch translation request")
-    parser.add_argument("--translate-timeout", type=int, default=DEFAULT_TRANSLATE_TIMEOUT, help="Timeout in seconds for each translation HTTP request when using network translators")
+    parser.add_argument("--translate-timeout", type=int, default=DEFAULT_TRANSLATE_TIMEOUT, help="Reserved for translation request timeout compatibility; local HY-MT ignores it")
     parser.add_argument("--hy-model", default=DEFAULT_HY_MODEL, help="Base HY-MT Hugging Face model id")
     parser.add_argument(
         "--hy-device",
@@ -198,9 +311,26 @@ def parse_args() -> argparse.Namespace:
         help="Runtime device for the local HY-MT translation model.",
     )
     parser.add_argument("--hy-max-new-tokens", type=int, default=DEFAULT_HY_MAX_NEW_TOKENS, help="Maximum number of tokens to generate per HY-MT translation segment")
-    parser.add_argument("--edge-rate", default=DEFAULT_EDGE_RATE, help="Edge TTS base speaking rate, e.g. -8%% or +5%%")
-    parser.add_argument("--edge-pitch", default=DEFAULT_EDGE_PITCH, help="Edge TTS pitch, e.g. -12Hz")
-    parser.add_argument("--edge-volume", default=DEFAULT_EDGE_VOLUME, help="Edge TTS volume, e.g. +0%%")
+    parser.add_argument("--gpt-sovits-url", default=DEFAULT_GPT_SOVITS_URL, help="Base URL of the local GPT-SoVITS API server")
+    parser.add_argument("--gpt-sovits-ref-audio", type=Path, default=None, help="Reference audio for GPT-SoVITS zero-shot synthesis")
+    parser.add_argument("--gpt-sovits-prompt-text", default="", help="Transcript matching the GPT-SoVITS reference audio")
+    parser.add_argument("--gpt-sovits-prompt-lang", default="", help="Language of the GPT-SoVITS reference audio, e.g. zh or en")
+    parser.add_argument(
+        "--gpt-sovits-text-lang",
+        default=DEFAULT_GPT_SOVITS_TEXT_LANG,
+        help="Target text language for GPT-SoVITS, e.g. auto, zh, en, ja, ko, yue",
+    )
+    parser.add_argument(
+        "--gpt-sovits-text-split-method",
+        default=DEFAULT_GPT_SOVITS_TEXT_SPLIT_METHOD,
+        help="Text split strategy passed to GPT-SoVITS, e.g. cut5",
+    )
+    parser.add_argument(
+        "--gpt-sovits-speed",
+        type=float,
+        default=DEFAULT_GPT_SOVITS_SPEED,
+        help="Base speaking speed factor passed to GPT-SoVITS",
+    )
     raw_args = sys.argv[1:]
     if raw_args and not raw_args[0].startswith("-") and "--video" not in raw_args and "--input-dir" not in raw_args:
         candidate = Path(raw_args[0]).expanduser()
@@ -208,11 +338,32 @@ def parse_args() -> argparse.Namespace:
         raw_args = [inferred_flag, raw_args[0], *raw_args[1:]]
 
     args = parser.parse_args(raw_args)
+    args, runtime_defaults_path = apply_runtime_defaults(args, raw_args)
     args.input_video = args.video
+    args.runtime_defaults_path = runtime_defaults_path
     if args.video and args.input_dir:
         parser.error("--video and --input-dir are mutually exclusive")
     if args.input_video is None and args.input_dir is None:
         parser.error("one of the following arguments is required: --video, --input-dir")
+    args.translation_provider = DEFAULT_TRANSLATION_PROVIDER
+    args.tts_provider = "gpt-sovits"
+    if args.gpt_sovits_ref_mode == "manual" and args.gpt_sovits_ref_audio is None:
+        parser.error("missing GPT-SoVITS defaults: run ./install.sh and ./init.sh once, or pass --gpt-sovits-ref-audio explicitly")
+    if args.gpt_sovits_ref_audio is not None:
+        args.gpt_sovits_ref_audio = args.gpt_sovits_ref_audio.expanduser()
+    if args.gpt_sovits_ref_mode == "manual" and not args.gpt_sovits_ref_audio.is_file():
+        parser.error(f"GPT-SoVITS reference audio not found: {args.gpt_sovits_ref_audio}")
+    if args.gpt_sovits_ref_mode == "manual" and not args.gpt_sovits_prompt_lang.strip():
+        parser.error("missing GPT-SoVITS prompt language: run ./init.sh once, or pass --gpt-sovits-prompt-lang explicitly")
+    try:
+        if args.gpt_sovits_ref_mode == "manual":
+            normalize_gpt_sovits_language(args.gpt_sovits_prompt_lang)
+        if args.gpt_sovits_text_lang != "auto":
+            normalize_gpt_sovits_language(args.gpt_sovits_text_lang)
+        else:
+            normalize_gpt_sovits_language(args.target_language)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.input_dir is not None and args.output is not None and args.output.suffix:
         parser.error("--output must be a directory path when used with --input-dir")
     return args
@@ -246,6 +397,35 @@ def run_command(
     return result
 
 
+def gpt_sovits_service_available(api_url: str, timeout_seconds: float = 3.0) -> bool:
+    with contextlib.suppress(requests.RequestException):
+        requests.get(api_url.rstrip("/") + "/", timeout=timeout_seconds)
+        return True
+    return False
+
+
+def ensure_gpt_sovits_service(api_url: str) -> None:
+    if gpt_sovits_service_available(api_url):
+        return
+    if not GPT_SOVITS_START_SCRIPT.is_file():
+        raise RuntimeError("GPT-SoVITS service is not reachable and start-gpt-sovits.sh is missing. Run ./init.sh first.")
+
+    result = run_command([str(GPT_SOVITS_START_SCRIPT)], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to start GPT-SoVITS service automatically.\n"
+            f"stdout:\n{result.stdout}\n\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    for _ in range(30):
+        if gpt_sovits_service_available(api_url):
+            return
+        time.sleep(2)
+
+    raise RuntimeError("GPT-SoVITS service did not become ready in time. Run ./init.sh or inspect start-gpt-sovits.sh logs.")
+
+
 def require_binary(binary: str) -> None:
     if shutil.which(binary) is None:
         raise FileNotFoundError(f"Required binary not found in PATH: {binary}")
@@ -267,9 +447,324 @@ def ffprobe_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def probe_duration_or_none(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    with contextlib.suppress(Exception):
+        return ffprobe_duration(path)
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioLevelStats:
+    mean_volume_db: float | None
+    max_volume_db: float | None
+
+
+def probe_audio_levels(path: Path) -> AudioLevelStats:
+    if not path.exists():
+        return AudioLevelStats(mean_volume_db=None, max_volume_db=None)
+    result = run_command(
+        [
+            "ffmpeg",
+            "-i",
+            str(path),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=False,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+
+    def extract_volume(name: str) -> float | None:
+        match = re.search(rf"{name}:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB", output)
+        if not match:
+            return None
+        value = match.group(1)
+        if value == "inf":
+            return float("inf")
+        return float(value)
+
+    return AudioLevelStats(
+        mean_volume_db=extract_volume("mean_volume"),
+        max_volume_db=extract_volume("max_volume"),
+    )
+
+
+def format_db_for_log(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value == float("inf"):
+        return "inf dB"
+    return f"{value:.1f} dB"
+
+
+def segment_audio_issue(levels: AudioLevelStats) -> str | None:
+    if levels.max_volume_db is None:
+        return "missing-levels"
+    if levels.max_volume_db <= -30.0:
+        return "very-quiet"
+    if levels.mean_volume_db is not None and levels.mean_volume_db <= -48.0:
+        return "mostly-silent"
+    return None
+
+
+def choose_better_audio_attempt(
+    current: tuple[Path, AudioLevelStats, float],
+    candidate: tuple[Path, AudioLevelStats, float],
+) -> tuple[Path, AudioLevelStats, float]:
+    current_issue = segment_audio_issue(current[1])
+    candidate_issue = segment_audio_issue(candidate[1])
+    if current_issue and not candidate_issue:
+        return candidate
+    if candidate_issue and not current_issue:
+        return current
+    current_max = current[1].max_volume_db
+    candidate_max = candidate[1].max_volume_db
+    if current_max is None:
+        return candidate
+    if candidate_max is None:
+        return current
+    if candidate_max > current_max:
+        return candidate
+    return current
+
+
+def sanitize_log_text(value: str, limit: int = 120) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def format_duration_for_log(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}s"
+
+
+def write_audio_audit_header(
+    log_path: Path,
+    *,
+    tts_provider: str,
+    total_duration: float,
+    gpt_sovits_config: GptSovitsConfig | None,
+    reference_source: str | None = None,
+    reference_detail: str | None = None,
+) -> None:
+    lines = [
+        "# Audio Audit Log",
+        f"tts_provider: {tts_provider}",
+        f"target_total_duration: {total_duration:.3f}s",
+    ]
+    if gpt_sovits_config is not None:
+        lines.extend(
+            [
+                f"gpt_sovits_api_url: {gpt_sovits_config.api_url}",
+                f"gpt_sovits_ref_audio: {gpt_sovits_config.ref_audio_path}",
+                f"gpt_sovits_ref_source: {reference_source or 'n/a'}",
+                f"gpt_sovits_ref_detail: {reference_detail or 'n/a'}",
+                f"gpt_sovits_prompt_lang: {gpt_sovits_config.prompt_lang}",
+                f"gpt_sovits_text_lang: {gpt_sovits_config.text_lang}",
+                f"gpt_sovits_speed_factor: {gpt_sovits_config.speed_factor}",
+            ]
+        )
+    lines.extend(["", "## Segment Audit"])
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def append_audio_audit_line(log_path: Path, line: str) -> None:
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def append_segment_audit_line(
+    log_path: Path,
+    *,
+    index: int,
+    backend: str,
+    original_start: float,
+    original_end: float,
+    scheduled_start: float,
+    scheduled_end: float,
+    translated_text: str,
+    raw_tts: Path,
+    adjusted_tts: Path | None,
+    raw_duration: float | None,
+    adjusted_duration: float | None,
+    speed_factor: float | None,
+    raw_levels: AudioLevelStats | None,
+    adjusted_levels: AudioLevelStats | None,
+    status: str,
+    quiet_retry_attempts: int = 0,
+    error: str | None = None,
+) -> None:
+    line = (
+        f"segment={index:04d} status={status} backend={backend} "
+        f"slot={original_start:.3f}-{original_end:.3f}s scheduled={scheduled_start:.3f}-{scheduled_end:.3f}s "
+        f"raw_exists={raw_tts.exists()} raw_duration={format_duration_for_log(raw_duration)} raw_path={raw_tts}"
+    )
+    if adjusted_tts is not None:
+        line += (
+            f" adjusted_exists={adjusted_tts.exists()} adjusted_duration={format_duration_for_log(adjusted_duration)}"
+            f" adjusted_path={adjusted_tts}"
+        )
+    if raw_levels is not None:
+        line += (
+            f" raw_mean_volume={format_db_for_log(raw_levels.mean_volume_db)}"
+            f" raw_max_volume={format_db_for_log(raw_levels.max_volume_db)}"
+        )
+    if adjusted_levels is not None:
+        line += (
+            f" adjusted_mean_volume={format_db_for_log(adjusted_levels.mean_volume_db)}"
+            f" adjusted_max_volume={format_db_for_log(adjusted_levels.max_volume_db)}"
+        )
+    if speed_factor is not None:
+        line += f" speed_factor={speed_factor:.3f}"
+    issue = segment_audio_issue(raw_levels) if raw_levels is not None else None
+    if issue:
+        line += f" issue={issue}"
+    line += f" quiet_retry_attempts={quiet_retry_attempts}"
+    line += f" text=\"{sanitize_log_text(translated_text)}\""
+    if error:
+        line += f" error=\"{sanitize_log_text(error, limit=240)}\""
+    append_audio_audit_line(log_path, line)
+
+
+def synthesize_segment_with_quiet_retry(
+    *,
+    text: str,
+    raw_tts: Path,
+    timeout_seconds: int,
+    retries: int,
+    gpt_sovits_config: GptSovitsConfig | None,
+    audit_log: Path,
+    segment_index: int,
+) -> tuple[str, float, AudioLevelStats, int]:
+    best_attempt: tuple[Path, AudioLevelStats, float] | None = None
+    backend = "gpt-sovits"
+    quiet_retry_attempts = 0
+
+    for attempt_index in range(QUIET_TTS_RETRIES + 1):
+        attempt_path = raw_tts.with_name(f"{raw_tts.stem}_attempt{attempt_index + 1}{raw_tts.suffix}")
+        backend = synthesize_segment_audio(
+            text,
+            attempt_path,
+            timeout_seconds,
+            retries,
+            gpt_sovits_config,
+        )
+        raw_duration = ffprobe_duration(attempt_path)
+        raw_levels = probe_audio_levels(attempt_path)
+        issue = segment_audio_issue(raw_levels)
+        attempt_record = (attempt_path, raw_levels, raw_duration)
+        best_attempt = attempt_record if best_attempt is None else choose_better_audio_attempt(best_attempt, attempt_record)
+        append_audio_audit_line(
+            audit_log,
+            (
+                f"segment={segment_index:04d} retry_attempt={attempt_index + 1} "
+                f"status={'accepted' if issue is None else 'suspicious'} raw_duration={format_duration_for_log(raw_duration)} "
+                f"raw_mean_volume={format_db_for_log(raw_levels.mean_volume_db)} "
+                f"raw_max_volume={format_db_for_log(raw_levels.max_volume_db)}"
+                + (f" issue={issue}" if issue else "")
+            ),
+        )
+        if issue not in QUIET_TTS_RETRY_ISSUES:
+            quiet_retry_attempts = attempt_index
+            shutil.copyfile(attempt_path, raw_tts)
+            return backend, raw_duration, raw_levels, quiet_retry_attempts
+        if attempt_index < QUIET_TTS_RETRIES:
+            quiet_retry_attempts = attempt_index + 1
+
+    if best_attempt is None:
+        raise RuntimeError("TTS attempt selection failed without producing audio")
+
+    shutil.copyfile(best_attempt[0], raw_tts)
+    return backend, best_attempt[2], best_attempt[1], quiet_retry_attempts
+
+
+def append_mix_audit_section(
+    log_path: Path,
+    *,
+    background_track: Path,
+    dub_track: Path,
+    output_video: Path,
+    background_volume: float,
+    dub_volume: float,
+) -> None:
+    append_audio_audit_line(log_path, "")
+    append_audio_audit_line(log_path, "## Mix Audit")
+    append_audio_audit_line(
+        log_path,
+        (
+            f"background_track_exists={background_track.exists()} "
+            f"background_track_duration={format_duration_for_log(probe_duration_or_none(background_track))} "
+            f"background_track_path={background_track} background_volume={background_volume}"
+        ),
+    )
+    append_audio_audit_line(
+        log_path,
+        (
+            f"dub_track_exists={dub_track.exists()} "
+            f"dub_track_duration={format_duration_for_log(probe_duration_or_none(dub_track))} "
+            f"dub_track_path={dub_track} dub_volume={dub_volume}"
+        ),
+    )
+    append_audio_audit_line(
+        log_path,
+        (
+            f"output_video_exists={output_video.exists()} "
+            f"output_video_duration={format_duration_for_log(probe_duration_or_none(output_video))} "
+            f"output_video_path={output_video}"
+        ),
+    )
+
+
+def ffprobe_streams(path: Path, stream_selector: str) -> list[dict[str, object]]:
+    result = run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            stream_selector,
+            "-show_streams",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    payload = json.loads(result.stdout or "{}")
+    streams = payload.get("streams")
+    return streams if isinstance(streams, list) else []
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def runtime_cache_root() -> Path:
+    return ensure_dir(DEFAULT_RUNTIME_CACHE_DIR)
+
+
+def runtime_hf_cache_dir() -> Path:
+    return ensure_dir(runtime_cache_root() / "huggingface")
+
+
+def runtime_whisper_cache_dir() -> Path:
+    return ensure_dir(runtime_cache_root() / "faster-whisper")
+
+
+def runtime_mdx_model_dir() -> Path:
+    return ensure_dir(runtime_cache_root() / "mdx")
+
+
+def runtime_demucs_model_dir() -> Path:
+    return ensure_dir(runtime_cache_root() / "demucs")
 
 
 def log_progress(stage: str, current: int, total: int, *, detail: str = "") -> None:
@@ -278,6 +773,133 @@ def log_progress(stage: str, current: int, total: int, *, detail: str = "") -> N
     if total <= 20 or current == 1 or current == total or current % 10 == 0:
         suffix = f" - {detail}" if detail else ""
         print(f"[info] {stage}: {current}/{total}{suffix}")
+
+
+def parse_srt_timestamp(value: str) -> float:
+    hours, minutes, seconds, milliseconds = re.split(r":|,", value.strip())
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(milliseconds) / 1000
+
+
+def parse_srt_blocks(srt_path: Path) -> list[SrtBlock]:
+    raw = srt_path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not raw:
+        return []
+
+    blocks: list[SrtBlock] = []
+    for chunk in re.split(r"\n\s*\n", raw):
+        lines = [line.strip("\ufeff") for line in chunk.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        timestamp_line = lines[1]
+        if "-->" not in timestamp_line:
+            continue
+        start_raw, end_raw = [part.strip() for part in timestamp_line.split("-->", maxsplit=1)]
+        text = normalize_segment_text(" ".join(lines[2:]))
+        if not text:
+            continue
+        blocks.append(SrtBlock(start=parse_srt_timestamp(start_raw), end=parse_srt_timestamp(end_raw), text=text))
+    return blocks
+
+
+def subtitle_stream_language(stream: dict[str, object]) -> str:
+    tags = stream.get("tags")
+    if isinstance(tags, dict):
+        language = tags.get("language") or tags.get("LANGUAGE")
+        if isinstance(language, str) and language.strip():
+            return language.strip().lower()
+    return "unknown"
+
+
+def detect_subtitle_language(texts: list[str], fallback_language: str) -> str:
+    joined = " ".join(texts)
+    if contains_cjk(joined):
+        return "zh"
+    if fallback_language in {"zh", "chi", "zho", "zh-cn", "zh-tw"}:
+        return "zh"
+    if fallback_language in {"en", "eng"}:
+        return "en"
+    return fallback_language or "unknown"
+
+
+def acquire_subtitle_track_segments(input_video: Path, workdir: Path) -> tuple[list[Segment], dict[str, object]]:
+    subtitle_streams = ffprobe_streams(input_video, "s")
+    if not subtitle_streams:
+        return [], {
+            "source_name": "subtitle-track",
+            "subtitle_language": "none",
+            "needs_translation": True,
+            "raw_source_srt": None,
+            "raw_secondary_srt": None,
+        }
+
+    supported_codecs = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
+    chosen_stream: dict[str, object] | None = None
+    for stream in subtitle_streams:
+        codec_name = str(stream.get("codec_name") or "").lower()
+        if codec_name in supported_codecs:
+            chosen_stream = stream
+            break
+    if chosen_stream is None:
+        return [], {
+            "source_name": "subtitle-track",
+            "subtitle_language": "none",
+            "needs_translation": True,
+            "raw_source_srt": None,
+            "raw_secondary_srt": None,
+        }
+
+    stream_index = chosen_stream.get("index")
+    if not isinstance(stream_index, int):
+        return [], {
+            "source_name": "subtitle-track",
+            "subtitle_language": "none",
+            "needs_translation": True,
+            "raw_source_srt": None,
+            "raw_secondary_srt": None,
+        }
+
+    subtitle_dir = ensure_dir(workdir / "subtitle_track")
+    extracted_srt = subtitle_dir / "embedded_subtitles.srt"
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-map",
+            f"0:{stream_index}",
+            str(extracted_srt),
+        ]
+    )
+
+    blocks = parse_srt_blocks(extracted_srt)
+    if not blocks:
+        return [], {
+            "source_name": "subtitle-track",
+            "subtitle_language": "none",
+            "needs_translation": True,
+            "raw_source_srt": extracted_srt,
+            "raw_secondary_srt": None,
+        }
+
+    texts = [block.text for block in blocks]
+    subtitle_language = detect_subtitle_language(texts, subtitle_stream_language(chosen_stream))
+    segments = [
+        Segment(
+            start=block.start,
+            end=block.end,
+            source_text=block.text,
+            translated_text=block.text if contains_cjk(block.text) else "",
+        )
+        for block in blocks
+    ]
+    return segments, {
+        "source_name": "subtitle-track",
+        "subtitle_language": subtitle_language,
+        "needs_translation": any(not segment.translated_text for segment in segments),
+        "raw_source_srt": extracted_srt,
+        "raw_secondary_srt": None,
+    }
 
 
 def load_whisper_model_class():
@@ -401,6 +1023,7 @@ def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
 
 def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs_device: str) -> tuple[Path, Path]:
     demucs_output = workdir / "demucs"
+    demucs_repo = runtime_demucs_model_dir()
     print(
         "[info] Demucs separation started "
         f"(device={demucs_device}). This step can take several minutes on long videos or on the first run."
@@ -412,6 +1035,8 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs
             "demucs.separate",
             "-n",
             "htdemucs_ft",
+            "--repo",
+            str(demucs_repo),
             "--two-stems=vocals",
             "-d",
             demucs_device,
@@ -426,6 +1051,55 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs
     background = separated_dir / "no_vocals.wav"
     if not vocals.exists() or not background.exists():
         raise FileNotFoundError("Demucs did not produce expected vocals/background stems")
+
+    speech_vocals = workdir / "vocals_16k.wav"
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(vocals),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(speech_vocals),
+        ]
+    )
+    return speech_vocals, background
+
+
+def separate_with_mdx(speech_mix: Path, full_mix: Path, workdir: Path, model_filename: str) -> tuple[Path, Path]:
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as exc:
+        raise RuntimeError(
+            "MDX-Net separation requires audio-separator. Install it with: pip install 'audio-separator[cpu]'"
+        ) from exc
+
+    mdx_output = ensure_dir(workdir / "mdx")
+    print(f"[info] MDX-Net separation started (model={model_filename}). This step may download the model on first run.")
+    separator = Separator(
+        output_dir=str(mdx_output),
+        output_format="WAV",
+        model_file_dir=str(runtime_mdx_model_dir()),
+        sample_rate=DUB_SAMPLE_RATE,
+        use_soundfile=True,
+    )
+    separator.load_model(model_filename=model_filename)
+    output_files = separator.separate(
+        str(full_mix),
+        {
+            "Vocals": "vocals",
+            "Instrumental": "instrumental",
+        },
+    )
+
+    vocals = mdx_output / "vocals.wav"
+    background = mdx_output / "instrumental.wav"
+    if not vocals.exists() or not background.exists():
+        produced = ", ".join(str(Path(path).name) for path in output_files)
+        raise FileNotFoundError(f"MDX-Net did not produce expected stems. Output files: {produced}")
 
     speech_vocals = workdir / "vocals_16k.wav"
     run_command(
@@ -478,15 +1152,25 @@ def separate_audio(
     full_mix: Path,
     workdir: Path,
     demucs_device: str,
+    mdx_model: str,
 ) -> tuple[Path, Path, str]:
     if strategy == "none":
         return speech_mix, full_mix, "none"
     if strategy == "ffmpeg":
         vocals, background = separate_with_ffmpeg(speech_mix, full_mix, workdir)
         return vocals, background, "ffmpeg"
+    if strategy == "mdx":
+        vocals, background = separate_with_mdx(speech_mix, full_mix, workdir, mdx_model)
+        return vocals, background, "mdx"
     if strategy == "demucs":
         vocals, background = separate_with_demucs(speech_mix, full_mix, workdir, demucs_device)
         return vocals, background, "demucs"
+
+    try:
+        vocals, background = separate_with_mdx(speech_mix, full_mix, workdir, mdx_model)
+        return vocals, background, "mdx"
+    except Exception as exc:
+        print(f"[warn] MDX-Net unavailable, falling back to Demucs separation: {exc}")
 
     try:
         vocals, background = separate_with_demucs(speech_mix, full_mix, workdir, demucs_device)
@@ -513,7 +1197,12 @@ def transcribe_audio(
     asr_compute_type: str,
 ) -> list[Segment]:
     print(f"[info] Loading ASR model '{model_name}' (device={asr_device}, compute_type={asr_compute_type})")
-    model = load_whisper_model_class()(model_name, device=asr_device, compute_type=asr_compute_type)
+    model = load_whisper_model_class()(
+        model_name,
+        device=asr_device,
+        compute_type=asr_compute_type,
+        download_root=str(runtime_whisper_cache_dir()),
+    )
     duration = ffprobe_duration(vocals_path)
     segments: list[Segment] = []
     chunk_dir = ensure_dir(vocals_path.parent / "chunks")
@@ -665,9 +1354,9 @@ def load_hy_runtime(base_model: str, requested_device: str) -> HyMtRuntime:
                 raise RuntimeError("FP8 HY-MT requires extra compressed-tensors setup and is skipped by default")
 
             print(f"[info] Loading translation model: {model_id} (device={resolved_device})")
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=str(runtime_hf_cache_dir()))
             dtype = torch.float32 if resolved_device == "cpu" else torch.float16
-            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, cache_dir=str(runtime_hf_cache_dir()))
             model.eval()
             if resolved_device != "cpu":
                 model.to(resolved_device)
@@ -764,13 +1453,8 @@ def build_translation_backend(
     hy_device: str,
     hy_max_new_tokens: int,
 ) -> TranslationBackend:
-    normalized_target = normalize_translate_code(target_language)
-    if provider == "google":
-        return TranslationBackend(
-            name="google",
-            translator=GoogleTranslator(source="auto", target=normalized_target),
-            uses_network_timeout=True,
-        )
+    _ = provider
+    _ = normalize_translate_code(target_language)
     return TranslationBackend(
         name="hy-local",
         translator=HyLocalTranslator(target_language, hy_model, hy_device, hy_max_new_tokens),
@@ -949,6 +1633,11 @@ def acquire_segments(
     ocr_min_chars: int,
     ocr_similarity: float,
 ) -> tuple[list[Segment], dict[str, object]]:
+    if subtitle_source == "auto":
+        segments, metadata = acquire_subtitle_track_segments(input_video, workdir)
+        if segments:
+            return segments, metadata
+
     if subtitle_source in {"auto", "ocr"}:
         segments, metadata = acquire_ocr_segments(input_video, workdir, ocr_fps, ocr_min_chars, ocr_similarity)
         if segments:
@@ -1005,65 +1694,380 @@ def normalize_translate_code(target_language: str) -> str:
     return mapping.get(target_language, target_language)
 
 
-async def synthesize_tts(text: str, voice: str, output_path: Path, rate: str, pitch: str, volume: str) -> None:
-    communicator = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch, volume=volume)
-    await communicator.save(str(output_path))
+def normalize_gpt_sovits_language(value: str) -> str:
+    normalized = value.strip().lower().replace("_", "-")
+    mapping = {
+        "zh": "zh",
+        "zh-cn": "zh",
+        "zh-hans": "zh",
+        "zh-tw": "zh",
+        "zh-hant": "zh",
+        "zho": "zh",
+        "chi": "zh",
+        "en": "en",
+        "english": "en",
+        "ja": "ja",
+        "jp": "ja",
+        "japanese": "ja",
+        "ko": "ko",
+        "korean": "ko",
+        "yue": "yue",
+        "cantonese": "yue",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    raise ValueError(f"Unsupported GPT-SoVITS language: {value}. Expected one of zh, en, ja, ko, yue, or auto for target text.")
 
 
-async def synthesize_tts_with_retry(
+def build_gpt_sovits_config(args: argparse.Namespace) -> GptSovitsConfig | None:
+    text_lang_value = args.gpt_sovits_text_lang
+    if text_lang_value == "auto":
+        text_lang_value = args.target_language
+
+    return GptSovitsConfig(
+        api_url=args.gpt_sovits_url.rstrip("/"),
+        ref_audio_path=args.gpt_sovits_ref_audio.resolve(),
+        prompt_text=args.gpt_sovits_prompt_text.strip(),
+        prompt_lang=normalize_gpt_sovits_language(args.gpt_sovits_prompt_lang),
+        text_lang=normalize_gpt_sovits_language(text_lang_value),
+        text_split_method=args.gpt_sovits_text_split_method,
+        speed_factor=max(args.gpt_sovits_speed, 0.05),
+    )
+
+
+def detect_reference_prompt_language(text: str) -> str:
+    normalized = normalize_segment_text(text)
+    if not normalized:
+        return DEFAULT_PROFILE_PROMPT_LANG
+    if contains_cjk(normalized):
+        return "zh"
+    return "en"
+
+
+def trim_reference_prompt_text(text: str, limit: int = 120) -> str:
+    normalized = normalize_segment_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    trimmed = normalized[:limit].rsplit(" ", 1)[0].strip()
+    return trimmed or normalized[:limit].strip()
+
+
+def build_reference_config_from_values(
+    *,
+    args: argparse.Namespace,
+    ref_audio_path: Path,
+    prompt_text: str,
+    prompt_lang: str,
+) -> GptSovitsConfig:
+    text_lang_value = args.gpt_sovits_text_lang
+    if text_lang_value == "auto":
+        text_lang_value = args.target_language
+    return GptSovitsConfig(
+        api_url=args.gpt_sovits_url.rstrip("/"),
+        ref_audio_path=ref_audio_path.resolve(),
+        prompt_text=prompt_text.strip(),
+        prompt_lang=normalize_gpt_sovits_language(prompt_lang),
+        text_lang=normalize_gpt_sovits_language(text_lang_value),
+        text_split_method=args.gpt_sovits_text_split_method,
+        speed_factor=max(args.gpt_sovits_speed, 0.05),
+    )
+
+
+def reference_segment_priority(segment: Segment) -> tuple[float, float, int]:
+    duration_score = -abs(min(segment.duration, 9.5) - 6.5)
+    punctuation_bonus = 1.0 if ends_sentence(segment.source_text) else 0.0
+    return (
+        duration_score + punctuation_bonus,
+        segment.duration,
+        min(len(normalize_segment_text(segment.source_text)), 180),
+    )
+
+
+def export_reference_clip(source_audio: Path, start: float, end: float, output_path: Path) -> None:
+    clip_duration = max(end - start, 0.35)
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{clip_duration:.3f}",
+            "-i",
+            str(source_audio),
+            "-ac",
+            "1",
+            "-ar",
+            "32000",
+            str(output_path),
+        ]
+    )
+
+
+def detect_single_speaker_reference(
+    args: argparse.Namespace,
+    vocals_path: Path,
+    segments: list[Segment],
+    workdir: Path,
+) -> GptSovitsReferenceSelection | None:
+    reference_dir = ensure_dir(workdir / "reference")
+    candidates = [
+        segment
+        for segment in segments
+        if 3.0 <= segment.duration <= 12.0 and len(normalize_segment_text(segment.source_text)) >= 12
+    ]
+    if not candidates:
+        return None
+
+    for candidate_index, segment in enumerate(sorted(candidates, key=reference_segment_priority, reverse=True)[:8], start=1):
+        prompt_text = trim_reference_prompt_text(segment.source_text)
+        if len(prompt_text) < 8:
+            continue
+        clip_path = reference_dir / f"auto_ref_{candidate_index:02d}.wav"
+        export_reference_clip(vocals_path, segment.start, segment.end, clip_path)
+        levels = probe_audio_levels(clip_path)
+        if segment_audio_issue(levels) in {"very-quiet", "mostly-silent"}:
+            continue
+        detected_pitch_hz = estimate_pitch_hz(clip_path)
+        return GptSovitsReferenceSelection(
+            config=build_reference_config_from_values(
+                args=args,
+                ref_audio_path=clip_path,
+                prompt_text=prompt_text,
+                prompt_lang=detect_reference_prompt_language(prompt_text),
+            ),
+            source="auto-source-segment",
+            detail=f"segment={segment.start:.3f}-{segment.end:.3f}s",
+            detected_pitch_hz=detected_pitch_hz,
+        )
+    return None
+
+
+def fallback_reference_search_paths(filename: str) -> list[Path]:
+    return [
+        PROJECT_ROOT / filename,
+        PROJECT_ROOT / "artifacts" / filename,
+        PROJECT_ROOT / "samples" / filename,
+        Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME / filename,
+    ]
+
+
+def resolve_existing_reference_path(value: object, default_filename: str) -> Path | None:
+    candidates: list[Path] = []
+    if value:
+        candidates.append(Path(str(value)).expanduser())
+    candidates.extend(fallback_reference_search_paths(default_filename))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+def estimate_pitch_hz(path: Path) -> float | None:
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="vt-pitch-") as temp_dir:
+        wav_path = Path(temp_dir) / "pitch_probe.wav"
+        run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(wav_path),
+            ]
+        )
+        with wave.open(str(wav_path), "rb") as handle:
+            sample_rate = handle.getframerate()
+            sample_width = handle.getsampwidth()
+            frames = handle.readframes(handle.getnframes())
+
+    if sample_width == 2:
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        samples = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        return None
+    if samples.size < sample_rate:
+        return None
+
+    samples = samples - float(np.mean(samples))
+    window_size = min(sample_rate * 2, samples.size)
+    step = max(window_size // 4, sample_rate // 5)
+    best_window = None
+    best_energy = 0.0
+    max_start = max(samples.size - window_size, 1)
+    for start in range(0, max_start, step):
+        window = samples[start : start + window_size]
+        energy = float(np.sqrt(np.mean(window * window)))
+        if energy > best_energy:
+            best_energy = energy
+            best_window = window
+    if best_window is None or best_energy < 0.01:
+        return None
+
+    min_lag = max(1, int(sample_rate / 280.0))
+    max_lag = min(len(best_window) - 1, int(sample_rate / 85.0))
+    if max_lag <= min_lag:
+        return None
+    autocorr = np.correlate(best_window, best_window, mode="full")[len(best_window) - 1 :]
+    if autocorr.size <= max_lag or autocorr[0] <= 0:
+        return None
+    lag_slice = autocorr[min_lag : max_lag + 1]
+    peak_offset = int(np.argmax(lag_slice))
+    peak_lag = min_lag + peak_offset
+    peak_value = float(autocorr[peak_lag])
+    if peak_value <= autocorr[0] * 0.18:
+        return None
+    pitch_hz = sample_rate / float(peak_lag)
+    if not math.isfinite(pitch_hz):
+        return None
+    return pitch_hz
+
+
+def preferred_fallback_gender(vocals_path: Path, workdir: Path, segments: list[Segment]) -> str:
+    pitch_estimates: list[float] = []
+    reference_dir = ensure_dir(workdir / "reference")
+    candidates = [segment for segment in segments if 2.0 <= segment.duration <= 10.0 and len(normalize_segment_text(segment.source_text)) >= 8]
+    for index, segment in enumerate(sorted(candidates, key=reference_segment_priority, reverse=True)[:5], start=1):
+        probe_clip = reference_dir / f"pitch_probe_{index:02d}.wav"
+        export_reference_clip(vocals_path, segment.start, segment.end, probe_clip)
+        pitch_hz = estimate_pitch_hz(probe_clip)
+        if pitch_hz is not None:
+            pitch_estimates.append(pitch_hz)
+    if not pitch_estimates:
+        return "female"
+    median_pitch = statistics.median(pitch_estimates)
+    return "female" if median_pitch >= 165.0 else "male"
+
+
+def detect_fallback_reference(
+    args: argparse.Namespace,
+    vocals_path: Path,
+    workdir: Path,
+    segments: list[Segment],
+) -> GptSovitsReferenceSelection | None:
+    preferred_gender = preferred_fallback_gender(vocals_path, workdir, segments)
+    ordered = [preferred_gender, "male" if preferred_gender == "female" else "female"]
+    path_map = {
+        "female": resolve_existing_reference_path(args.gpt_sovits_fallback_female_audio, DEFAULT_GPT_SOVITS_FALLBACK_FEMALE_REF.name),
+        "male": resolve_existing_reference_path(args.gpt_sovits_fallback_male_audio, DEFAULT_GPT_SOVITS_FALLBACK_MALE_REF.name),
+    }
+    for gender in ordered:
+        audio_path = path_map[gender]
+        if audio_path is None:
+            continue
+        return GptSovitsReferenceSelection(
+            config=build_reference_config_from_values(
+                args=args,
+                ref_audio_path=audio_path,
+                prompt_text=DEFAULT_PROFILE_PROMPT_TEXT,
+                prompt_lang=DEFAULT_PROFILE_PROMPT_LANG,
+            ),
+            source=f"fallback-{gender}",
+            detail=audio_path.name,
+            detected_pitch_hz=None,
+        )
+    return None
+
+
+def resolve_gpt_sovits_reference(
+    args: argparse.Namespace,
+    vocals_path: Path,
+    segments: list[Segment],
+    workdir: Path,
+) -> GptSovitsReferenceSelection:
+    manual_config = build_gpt_sovits_config(args) if args.gpt_sovits_ref_audio else None
+    if args.gpt_sovits_ref_mode == "manual":
+        if manual_config is None:
+            raise RuntimeError("Manual GPT-SoVITS mode requires an explicit reference audio")
+        return GptSovitsReferenceSelection(config=manual_config, source="manual", detail="explicit-or-default")
+
+    auto_reference = detect_single_speaker_reference(args, vocals_path, segments, workdir)
+    if auto_reference is not None:
+        return auto_reference
+
+    fallback_reference = detect_fallback_reference(args, vocals_path, workdir, segments)
+    if fallback_reference is not None:
+        return fallback_reference
+
+    if manual_config is not None:
+        return GptSovitsReferenceSelection(config=manual_config, source="bundled-fallback", detail=manual_config.ref_audio_path.name)
+    raise RuntimeError("Unable to resolve any GPT-SoVITS reference audio")
+
+
+def synthesize_segment_audio(
     text: str,
-    voice: str,
     output_path: Path,
     timeout_seconds: int,
     retries: int,
-    rate: str,
-    pitch: str,
-    volume: str,
+    gpt_sovits_config: GptSovitsConfig | None,
+) -> str:
+    if gpt_sovits_config is None:
+        raise RuntimeError("GPT-SoVITS configuration is missing")
+    try:
+        synthesize_gpt_sovits_with_retry(text, output_path, timeout_seconds, retries, gpt_sovits_config)
+        return "gpt-sovits"
+    except Exception as exc:
+        raise RuntimeError(f"GPT-SoVITS failed: {exc}") from exc
+
+
+def synthesize_gpt_sovits(text: str, output_path: Path, timeout_seconds: int, config: GptSovitsConfig) -> None:
+    endpoint = f"{config.api_url}/tts"
+    payload = {
+        "text": text,
+        "text_lang": config.text_lang,
+        "ref_audio_path": str(config.ref_audio_path),
+        "prompt_text": config.prompt_text,
+        "prompt_lang": config.prompt_lang,
+        "media_type": "wav",
+        "streaming_mode": False,
+        "speed_factor": config.speed_factor,
+        "text_split_method": config.text_split_method,
+    }
+    response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
+    content_type = response.headers.get("content-type", "")
+    if not response.ok:
+        detail = response.text.strip()
+        with contextlib.suppress(Exception):
+            detail = response.json().get("message") or detail
+        raise RuntimeError(f"{response.status_code} {detail}".strip())
+    if "application/json" in content_type.lower():
+        detail = response.text.strip()
+        with contextlib.suppress(Exception):
+            detail = response.json().get("message") or detail
+        raise RuntimeError(detail or "GPT-SoVITS returned JSON instead of audio")
+    if not response.content:
+        raise RuntimeError("GPT-SoVITS returned an empty audio payload")
+    output_path.write_bytes(response.content)
+
+
+def synthesize_gpt_sovits_with_retry(
+    text: str,
+    output_path: Path,
+    timeout_seconds: int,
+    retries: int,
+    config: GptSovitsConfig,
 ) -> None:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            await asyncio.wait_for(
-                synthesize_tts(text, voice, output_path, rate, pitch, volume),
-                timeout=timeout_seconds,
-            )
+            synthesize_gpt_sovits(text, output_path, timeout_seconds, config)
             return
         except Exception as exc:
             last_error = exc
             if attempt == retries:
                 break
-            await asyncio.sleep(min(attempt * 2, 6))
+            time.sleep(min(attempt * 2, 6))
     if last_error is None:
-        raise RuntimeError("Edge TTS failed without raising an explicit exception")
+        raise RuntimeError("GPT-SoVITS failed without raising an explicit exception")
     raise last_error
-
-
-def synthesize_segment_audio(
-    text: str,
-    edge_voice: str,
-    output_path: Path,
-    timeout_seconds: int,
-    retries: int,
-    edge_rate: str,
-    edge_pitch: str,
-    edge_volume: str,
-) -> str:
-    try:
-        asyncio.run(
-            synthesize_tts_with_retry(
-                text,
-                edge_voice,
-                output_path,
-                timeout_seconds,
-                retries,
-                edge_rate,
-                edge_pitch,
-                edge_volume,
-            )
-        )
-        return "edge-tts"
-    except Exception as exc:
-        raise RuntimeError(f"Edge TTS failed: {exc}") from exc
 
 
 def build_atempo_chain(playback_ratio: float) -> str:
@@ -1112,17 +2116,25 @@ def planned_segment_duration(input_duration: float, base_duration: float) -> flo
 
 def synthesize_segments(
     segments: list[Segment],
-    voice: str,
     total_duration: float,
     workdir: Path,
     timeout_seconds: int,
     retries: int,
-    edge_rate: str,
-    edge_pitch: str,
-    edge_volume: str,
+    gpt_sovits_config: GptSovitsConfig | None,
+    reference_source: str | None = None,
+    reference_detail: str | None = None,
 ) -> tuple[Path, list[str]]:
     tts_dir = ensure_dir(workdir / "tts")
     timeline_dir = ensure_dir(workdir / "timeline")
+    audit_log = workdir / "audio_audit.log"
+    write_audio_audit_header(
+        audit_log,
+        tts_provider="gpt-sovits",
+        total_duration=total_duration,
+        gpt_sovits_config=gpt_sovits_config,
+        reference_source=reference_source,
+        reference_detail=reference_detail,
+    )
     entries: list[Path] = []
     tts_backends: list[str] = []
     cursor = 0.0
@@ -1139,26 +2151,68 @@ def synthesize_segments(
             entries.append(silence)
             cursor = scheduled_start
 
-        raw_tts = tts_dir / f"segment_{index:04d}.mp3"
-        backend = synthesize_segment_audio(
-            segment.translated_text,
-            voice,
-            raw_tts,
-            timeout_seconds,
-            retries,
-            edge_rate,
-            edge_pitch,
-            edge_volume,
-        )
-        tts_backends.append(backend)
-        raw_duration = ffprobe_duration(raw_tts)
-        base_duration = max(original_end - original_start, 0.35)
-        target_duration = planned_segment_duration(raw_duration, base_duration)
-        remaining_duration = max(total_duration - scheduled_start, 0.35)
-        target_duration = min(target_duration, remaining_duration)
-
+        raw_extension = ".wav"
+        raw_tts = tts_dir / f"segment_{index:04d}{raw_extension}"
         adjusted_tts = tts_dir / f"segment_{index:04d}_fit.wav"
-        adjusted_duration, speed_factor = fit_audio_to_slot(raw_tts, adjusted_tts, target_duration)
+        try:
+            backend, raw_duration, raw_levels, quiet_retry_attempts = synthesize_segment_with_quiet_retry(
+                text=segment.translated_text,
+                raw_tts=raw_tts,
+                timeout_seconds=timeout_seconds,
+                retries=retries,
+                gpt_sovits_config=gpt_sovits_config,
+                audit_log=audit_log,
+                segment_index=index,
+            )
+            tts_backends.append(backend)
+            base_duration = max(original_end - original_start, 0.35)
+            target_duration = planned_segment_duration(raw_duration, base_duration)
+            remaining_duration = max(total_duration - scheduled_start, 0.35)
+            target_duration = min(target_duration, remaining_duration)
+            adjusted_duration, speed_factor = fit_audio_to_slot(raw_tts, adjusted_tts, target_duration)
+            adjusted_levels = probe_audio_levels(adjusted_tts)
+        except Exception as exc:
+            append_segment_audit_line(
+                audit_log,
+                index=index,
+                backend="gpt-sovits",
+                original_start=original_start,
+                original_end=original_end,
+                scheduled_start=scheduled_start,
+                scheduled_end=scheduled_start,
+                translated_text=segment.translated_text,
+                raw_tts=raw_tts,
+                adjusted_tts=adjusted_tts if adjusted_tts.exists() else None,
+                raw_duration=probe_duration_or_none(raw_tts),
+                adjusted_duration=probe_duration_or_none(adjusted_tts),
+                speed_factor=None,
+                raw_levels=probe_audio_levels(raw_tts),
+                adjusted_levels=probe_audio_levels(adjusted_tts) if adjusted_tts.exists() else None,
+                status="failed",
+                quiet_retry_attempts=0,
+                error=str(exc),
+            )
+            raise
+
+        append_segment_audit_line(
+            audit_log,
+            index=index,
+            backend=backend,
+            original_start=original_start,
+            original_end=original_end,
+            scheduled_start=scheduled_start,
+            scheduled_end=scheduled_start + adjusted_duration,
+            translated_text=segment.translated_text,
+            raw_tts=raw_tts,
+            adjusted_tts=adjusted_tts,
+            raw_duration=raw_duration,
+            adjusted_duration=adjusted_duration,
+            speed_factor=speed_factor,
+            raw_levels=raw_levels,
+            adjusted_levels=adjusted_levels,
+            status="ok",
+            quiet_retry_attempts=quiet_retry_attempts,
+        )
 
         segment.start = scheduled_start
         segment.end = scheduled_start + adjusted_duration
@@ -1194,6 +2248,12 @@ def synthesize_segments(
             str(concat_list),
             str(dub_track),
         ]
+    )
+    append_audio_audit_line(audit_log, "")
+    append_audio_audit_line(audit_log, "## Dub Track Summary")
+    append_audio_audit_line(
+        audit_log,
+        f"dub_track_exists={dub_track.exists()} dub_track_duration={format_duration_for_log(probe_duration_or_none(dub_track))} dub_track_path={dub_track}",
     )
     return dub_track, tts_backends
 
@@ -1279,6 +2339,7 @@ def resolve_batch_output_dir(input_dir: Path, output_arg: Path | None) -> Path:
 
 
 def run_translation(args: argparse.Namespace, input_video: Path, output_video: Path, workdir: Path) -> None:
+    ensure_gpt_sovits_service(args.gpt_sovits_url)
     asr_device, asr_compute_type = resolve_asr_runtime(args.asr_device, args.asr_compute_type)
     demucs_device = resolve_demucs_device(args.demucs_device)
 
@@ -1297,6 +2358,7 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
         full_mix,
         workdir,
         demucs_device,
+        args.mdx_model,
     )
     print(f"[info] Separation mode: {separation_mode}")
 
@@ -1345,17 +2407,27 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
             segment.translated_text = segment.source_text
     source_srt = write_srt(segments, workdir / "source.srt", "source_text")
     translated_srt = write_srt(segments, workdir / "translated.srt", "translated_text")
+    print("[info] Resolving GPT-SoVITS reference voice")
+    gpt_sovits_reference = resolve_gpt_sovits_reference(
+        args,
+        vocals_path,
+        segments,
+        workdir,
+    )
+    print(
+        f"[info] GPT-SoVITS reference source: {gpt_sovits_reference.source}"
+        + (f" ({gpt_sovits_reference.detail})" if gpt_sovits_reference.detail else "")
+    )
     print("[info] Synthesizing dubbed speech")
     dub_track, tts_backends = synthesize_segments(
         segments,
-        args.voice,
         total_duration,
         workdir,
         args.tts_timeout,
         args.tts_retries,
-        args.edge_rate,
-        args.edge_pitch,
-        args.edge_volume,
+        gpt_sovits_reference.config,
+        reference_source=gpt_sovits_reference.source,
+        reference_detail=gpt_sovits_reference.detail,
     )
     print("[info] Mixing dubbed speech back into the video")
     mix_audio(
@@ -1363,6 +2435,14 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
         background_track,
         dub_track,
         output_video,
+        background_volume=args.background_volume,
+        dub_volume=args.dub_volume,
+    )
+    append_mix_audit_section(
+        workdir / "audio_audit.log",
+        background_track=background_track,
+        dub_track=dub_track,
+        output_video=output_video,
         background_volume=args.background_volume,
         dub_volume=args.dub_volume,
     )
@@ -1374,8 +2454,7 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
             "input_video": str(input_video),
             "output_video": str(output_video),
             "target_language": args.target_language,
-            "voice": args.voice,
-            "tts_provider": "edge",
+            "tts_provider": "gpt-sovits",
             "translation_provider": args.translation_provider,
             "resolved_translation_provider": translation_metadata["resolved_translation_provider"],
             "translation_model": translation_metadata["translation_model"],
@@ -1393,22 +2472,31 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
             "ocr_similarity": args.ocr_similarity,
             "chunk_seconds": args.chunk_seconds,
             "separation_mode": separation_mode,
+            "mdx_model": args.mdx_model,
             "demucs_device": args.demucs_device,
             "resolved_demucs_device": demucs_device,
             "tts_backends": sorted(set(tts_backends)),
             "tts_timeout": args.tts_timeout,
             "tts_retries": args.tts_retries,
+            "gpt_sovits_url": args.gpt_sovits_url,
+            "gpt_sovits_ref_mode": args.gpt_sovits_ref_mode,
+            "gpt_sovits_ref_source": gpt_sovits_reference.source,
+            "gpt_sovits_ref_detail": gpt_sovits_reference.detail,
+            "gpt_sovits_ref_audio": str(gpt_sovits_reference.config.ref_audio_path),
+            "gpt_sovits_prompt_text": gpt_sovits_reference.config.prompt_text,
+            "gpt_sovits_prompt_lang": gpt_sovits_reference.config.prompt_lang,
+            "gpt_sovits_text_lang": args.gpt_sovits_text_lang,
+            "gpt_sovits_text_split_method": args.gpt_sovits_text_split_method,
+            "gpt_sovits_speed": args.gpt_sovits_speed,
             "translate_retries": args.translate_retries,
             "translate_batch_size": args.translate_batch_size,
             "translate_timeout": args.translate_timeout,
-                "hy_model": args.hy_model,
-                "hy_device": args.hy_device,
-                "hy_max_new_tokens": args.hy_max_new_tokens,
+            "hy_model": args.hy_model,
+            "hy_device": args.hy_device,
+            "hy_max_new_tokens": args.hy_max_new_tokens,
             "background_volume": args.background_volume,
             "dub_volume": args.dub_volume,
-            "edge_rate": args.edge_rate,
-            "edge_pitch": args.edge_pitch,
-            "edge_volume": args.edge_volume,
+            "audio_audit_log": str(workdir / "audio_audit.log"),
             "source_srt": str(source_srt),
             "translated_srt": str(translated_srt),
             "ocr_source_srt": str(subtitle_metadata["raw_source_srt"]) if subtitle_metadata["raw_source_srt"] else None,

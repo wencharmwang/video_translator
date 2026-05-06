@@ -19,3 +19,8 @@ artifacts/
 *.mov
 samples/
 SPEC.MD
+video_translator.defaults.json
+gpt_sovits.local.json
+.video-translator/
+downloads/
+GPT_SoVITS/
