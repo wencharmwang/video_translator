@@ -1,0 +1,1 @@
+"""Bundled runtime assets for installed video_translator distributions."""

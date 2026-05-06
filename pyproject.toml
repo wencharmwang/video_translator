@@ -49,6 +49,10 @@ ocr-subtitles = "ocr_subtitles:main"
 
 [tool.setuptools]
 py-modules = ["video_translator", "ocr_subtitles"]
+packages = ["video_translator_assets"]
+
+[tool.setuptools.package-data]
+video_translator_assets = ["female.mp3", "male.wav"]
 
 [tool.setuptools.dynamic]
 version = {attr = "video_translator.__version__"}

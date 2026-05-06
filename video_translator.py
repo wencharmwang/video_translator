@@ -7,6 +7,7 @@ import contextlib
 import functools
 import json
 import math
+import os
 import re
 import requests
 import signal
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from ocr_subtitles import SubtitleBlock
 
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
@@ -179,9 +180,15 @@ class SrtBlock:
 
 
 def runtime_default_config_paths() -> list[Path]:
+    config_home = Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME
     return [
         PROJECT_ROOT / name for name in DEFAULT_PROFILE_FILENAMES
-    ] + [Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME / "config.json"]
+    ] + [config_home / "config.json"]
+
+
+def gpt_sovits_service_config_paths() -> list[Path]:
+    config_home = Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME
+    return [GPT_SOVITS_LOCAL_CONFIG, config_home / GPT_SOVITS_LOCAL_CONFIG.name]
 
 
 def bundled_runtime_defaults() -> dict[str, object]:
@@ -404,19 +411,82 @@ def gpt_sovits_service_available(api_url: str, timeout_seconds: float = 3.0) -> 
     return False
 
 
+def load_gpt_sovits_service_config() -> tuple[dict[str, object] | None, Path | None]:
+    for config_path in gpt_sovits_service_config_paths():
+        if not config_path.is_file():
+            continue
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"GPT-SoVITS service config must contain a JSON object: {config_path}")
+        return payload, config_path
+    return None, None
+
+
+def start_gpt_sovits_service_from_config() -> bool:
+    payload, config_path = load_gpt_sovits_service_config()
+    if payload is None or config_path is None:
+        return False
+
+    required_keys = ("python_bin", "api_script", "config_path", "gpt_sovits_root", "host", "port", "log_path", "pid_path")
+    missing = [key for key in required_keys if not payload.get(key)]
+    if missing:
+        joined = ", ".join(sorted(missing))
+        raise RuntimeError(f"GPT-SoVITS service config is missing required keys ({joined}): {config_path}")
+
+    python_bin = Path(str(payload["python_bin"])).expanduser()
+    api_script = Path(str(payload["api_script"])).expanduser()
+    runtime_config = Path(str(payload["config_path"])).expanduser()
+    gpt_root = Path(str(payload["gpt_sovits_root"])).expanduser()
+    log_path = Path(str(payload["log_path"])).expanduser()
+    pid_path = Path(str(payload["pid_path"])).expanduser()
+    host = str(payload["host"])
+    port = str(payload["port"])
+
+    for required_path in (python_bin, api_script, runtime_config):
+        if not required_path.is_file():
+            raise RuntimeError(f"GPT-SoVITS startup dependency is missing: {required_path}")
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    pythonpath_entries = [str(gpt_root), str(gpt_root / "GPT_SoVITS")]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+
+    with log_path.open("ab") as handle:
+        process = subprocess.Popen(
+            [str(python_bin), str(api_script), "-a", host, "-p", port, "-c", str(runtime_config)],
+            cwd=str(gpt_root),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    return True
+
+
 def ensure_gpt_sovits_service(api_url: str) -> None:
     if gpt_sovits_service_available(api_url):
         return
-    if not GPT_SOVITS_START_SCRIPT.is_file():
-        raise RuntimeError("GPT-SoVITS service is not reachable and start-gpt-sovits.sh is missing. Run ./init.sh first.")
 
-    result = run_command([str(GPT_SOVITS_START_SCRIPT)], check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Failed to start GPT-SoVITS service automatically.\n"
-            f"stdout:\n{result.stdout}\n\n"
-            f"stderr:\n{result.stderr}"
-        )
+    started = start_gpt_sovits_service_from_config()
+    if not started:
+        if not GPT_SOVITS_START_SCRIPT.is_file():
+            raise RuntimeError(
+                "GPT-SoVITS service is not reachable and no local service config was found. Run ./init.sh first."
+            )
+
+        result = run_command([str(GPT_SOVITS_START_SCRIPT)], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Failed to start GPT-SoVITS service automatically.\n"
+                f"stdout:\n{result.stdout}\n\n"
+                f"stderr:\n{result.stderr}"
+            )
 
     for _ in range(30):
         if gpt_sovits_service_available(api_url):
@@ -1844,12 +1914,20 @@ def detect_single_speaker_reference(
 
 
 def fallback_reference_search_paths(filename: str) -> list[Path]:
-    return [
+    candidates: list[Path] = []
+    with contextlib.suppress(Exception):
+        from importlib import resources
+
+        bundled_resource = resources.files("video_translator_assets").joinpath(filename)
+        if bundled_resource.is_file():
+            candidates.append(Path(bundled_resource))
+    candidates.extend([
         PROJECT_ROOT / filename,
         PROJECT_ROOT / "artifacts" / filename,
         PROJECT_ROOT / "samples" / filename,
         Path.home() / ".config" / DEFAULT_PROFILE_DIRNAME / filename,
-    ]
+    ])
+    return candidates
 
 
 def resolve_existing_reference_path(value: object, default_filename: str) -> Path | None:

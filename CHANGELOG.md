@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.5] - 2026-05-06
+
+### Changed
+
+- Added release packaging for bundled conservative fallback references so PyPI wheels now include `male.wav` and `female.mp3`.
+- Switched GPT-SoVITS auto-start in the Python runtime to read the local service JSON config directly, which removes the installed-wheel dependency on a repo-root shell script.
+- Extended init-time HY-MT prewarm to use the same `transformers` model-loading path as runtime so the first translation run no longer needs to download the full checkpoint again.
+
 ## [0.1.4] - 2026-04-28
 
 ### Changed
