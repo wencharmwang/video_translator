@@ -188,6 +188,8 @@ video-translator \
 - `--asr-model tiny|small|medium|large-v3`：ASR 模型大小
 - `--chunk-seconds 300`：长视频 ASR 分块时长
 - `--ocr-fps 1.0`：OCR 抽帧频率
+- `--trim-start 8`：处理前先裁掉开头 8 秒
+- `--trim-end 5`：处理前再裁掉结尾 5 秒
 - `--hy-device auto|cpu|mps|cuda`：HY-MT 运行设备
 - `--hy-model tencent/HY-MT1.5-1.8B`：HY-MT 模型 ID
 - `--gpt-sovits-url http://127.0.0.1:9880`：本地 GPT-SoVITS API
@@ -207,6 +209,23 @@ video-translator \
 ```bash
 ./install.sh
 ./video-translator ./samples/video_test_5.mov
+```
+
+去掉片头/片尾版权画面：
+
+```bash
+./video-translator ./samples/video_test_5.mov --trim-start 8 --trim-end 5
+```
+
+批量处理目录并统一裁掉片头：
+
+```bash
+./video-translator \
+	--input-dir ~/Downloads/prehistoric_planet_s1 \
+	--trim-start 8 \
+	--gpt-sovits-ref-audio ./male.wav \
+	--gpt-sovits-prompt-lang zh \
+	--gpt-sovits-prompt-text "您好，很高兴能为您提供配音服务，选择您感兴趣的音色，让我们一起开启声音创作的奇幻之旅吧。"
 ```
 
 ### 显式指定参考音频

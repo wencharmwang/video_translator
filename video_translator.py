@@ -287,6 +287,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-fps", type=float, default=DEFAULT_OCR_FPS, help="Frame sampling rate for OCR subtitle extraction")
     parser.add_argument("--ocr-min-chars", type=int, default=DEFAULT_OCR_MIN_CHARS, help="Minimum characters required for an OCR subtitle sample")
     parser.add_argument("--ocr-similarity", type=float, default=DEFAULT_OCR_SIMILARITY, help="Similarity threshold for merging OCR subtitle samples")
+    parser.add_argument("--trim-start", type=float, default=0.0, help="Trim this many seconds from the start of each input video before processing")
+    parser.add_argument("--trim-end", type=float, default=0.0, help="Trim this many seconds from the end of each input video before processing")
     parser.add_argument("--chunk-seconds", type=int, default=DEFAULT_CHUNK_SECONDS, help="Chunk duration for ASR processing")
     parser.add_argument("--workdir", type=Path, default=None, help="Directory for intermediate files")
     parser.add_argument(
@@ -352,6 +354,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--video and --input-dir are mutually exclusive")
     if args.input_video is None and args.input_dir is None:
         parser.error("one of the following arguments is required: --video, --input-dir")
+    if args.trim_start < 0:
+        parser.error("--trim-start must be >= 0")
+    if args.trim_end < 0:
+        parser.error("--trim-end must be >= 0")
     args.translation_provider = DEFAULT_TRANSLATION_PROVIDER
     args.tts_provider = "gpt-sovits"
     if args.gpt_sovits_ref_mode == "manual" and args.gpt_sovits_ref_audio is None:
@@ -515,6 +521,54 @@ def ffprobe_duration(path: Path) -> float:
         ]
     )
     return float(result.stdout.strip())
+
+
+def trim_video(input_video: Path, output_video: Path, trim_start: float, trim_end: float) -> float:
+    source_duration = ffprobe_duration(input_video)
+    safe_trim_start = max(trim_start, 0.0)
+    safe_trim_end = max(trim_end, 0.0)
+    trimmed_duration = source_duration - safe_trim_start - safe_trim_end
+    if trimmed_duration <= 0.0:
+        raise ValueError(
+            f"Invalid trim window for {input_video.name}: start={safe_trim_start:.3f}s end={safe_trim_end:.3f}s exceeds duration={source_duration:.3f}s"
+        )
+
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-ss",
+            f"{safe_trim_start:.3f}",
+            "-t",
+            f"{trimmed_duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_video),
+        ]
+    )
+    return trimmed_duration
+
+
+def prepare_input_video(input_video: Path, workdir: Path, trim_start: float, trim_end: float) -> tuple[Path, float, float]:
+    original_duration = ffprobe_duration(input_video)
+    if trim_start <= 0.0 and trim_end <= 0.0:
+        return input_video, original_duration, original_duration
+
+    prepared_video = workdir / "trimmed_input.mp4"
+    trimmed_duration = trim_video(input_video, prepared_video, trim_start, trim_end)
+    return prepared_video, original_duration, trimmed_duration
 
 
 def probe_duration_or_none(path: Path) -> float | None:
@@ -2420,15 +2474,25 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
     ensure_gpt_sovits_service(args.gpt_sovits_url)
     asr_device, asr_compute_type = resolve_asr_runtime(args.asr_device, args.asr_compute_type)
     demucs_device = resolve_demucs_device(args.demucs_device)
+    prepared_input_video, original_duration, total_duration = prepare_input_video(
+        input_video,
+        workdir,
+        args.trim_start,
+        args.trim_end,
+    )
 
     print(f"[info] Working directory: {workdir}")
-    total_duration = ffprobe_duration(input_video)
     print(f"[info] Video duration: {total_duration:.1f}s")
+    if prepared_input_video != input_video:
+        print(
+            f"[info] Trimmed input video: start={args.trim_start:.1f}s end={args.trim_end:.1f}s "
+            f"original={original_duration:.1f}s trimmed={total_duration:.1f}s"
+        )
     print(f"[info] ASR runtime: device={asr_device}, compute_type={asr_compute_type}")
     print(f"[info] Demucs runtime: device={demucs_device}")
 
     print("[info] Extracting source audio")
-    full_mix, speech_mix = extract_audio(input_video, workdir)
+    full_mix, speech_mix = extract_audio(prepared_input_video, workdir)
     print("[info] Separating vocals and background")
     vocals_path, background_track, separation_mode = separate_audio(
         args.separator,
@@ -2442,7 +2506,7 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
 
     print("[info] Acquiring subtitle segments")
     segments, subtitle_metadata = acquire_segments(
-        input_video,
+        prepared_input_video,
         vocals_path,
         workdir,
         args.subtitle_source,
@@ -2509,7 +2573,7 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
     )
     print("[info] Mixing dubbed speech back into the video")
     mix_audio(
-        input_video,
+        prepared_input_video,
         background_track,
         dub_track,
         output_video,
@@ -2530,7 +2594,10 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
         workdir,
         {
             "input_video": str(input_video),
+            "processed_input_video": str(prepared_input_video),
             "output_video": str(output_video),
+            "original_input_duration": original_duration,
+            "processed_input_duration": total_duration,
             "target_language": args.target_language,
             "tts_provider": "gpt-sovits",
             "translation_provider": args.translation_provider,
@@ -2548,6 +2615,8 @@ def run_translation(args: argparse.Namespace, input_video: Path, output_video: P
             "ocr_fps": args.ocr_fps,
             "ocr_min_chars": args.ocr_min_chars,
             "ocr_similarity": args.ocr_similarity,
+            "trim_start": args.trim_start,
+            "trim_end": args.trim_end,
             "chunk_seconds": args.chunk_seconds,
             "separation_mode": separation_mode,
             "mdx_model": args.mdx_model,

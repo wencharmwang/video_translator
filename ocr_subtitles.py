@@ -17,6 +17,7 @@ from rapidocr_onnxruntime import RapidOCR
 
 DEFAULT_FPS = 2.0
 DEFAULT_MIN_CHARS = 10
+DEFAULT_MIN_CHINESE_CHARS = 3
 DEFAULT_SIMILARITY = 0.72
 DEFAULT_CROP_X = 0.0
 DEFAULT_CROP_Y = 0.0
@@ -112,6 +113,8 @@ def build_filter(args: argparse.Namespace) -> str:
 
 
 def extract_frames(input_video: Path, frames_dir: Path, args: argparse.Namespace) -> list[Path]:
+    for existing_frame in frames_dir.glob("frame_*.png"):
+        existing_frame.unlink()
     frame_pattern = frames_dir / "frame_%06d.png"
     run_command(
         [
@@ -183,15 +186,50 @@ def normalize_chinese_text(text: str) -> str:
     return cleaned.strip("，。！？：；、“”‘’… ")
 
 
+def combine_subtitle_candidates(
+    candidates: list[tuple[float, float, float, str]],
+    piece_joiner: str,
+    line_joiner: str,
+    y_tolerance: float,
+) -> str:
+    if not candidates:
+        return ""
+
+    grouped_lines: list[dict[str, object]] = []
+    for average_y, average_x, score, text in sorted(candidates, key=lambda item: (item[0], item[1], -item[2], len(item[3]))):
+        if not grouped_lines or abs(average_y - float(grouped_lines[-1]["average_y"])) > y_tolerance:
+            grouped_lines.append({"average_y": average_y, "parts": [(average_x, score, text)]})
+            continue
+        grouped_lines[-1]["parts"].append((average_x, score, text))
+
+    combined_lines: list[str] = []
+    for line in grouped_lines:
+        parts = sorted(line["parts"], key=lambda item: (item[0], -item[1], len(item[2])))
+        merged_parts: list[str] = []
+        for _average_x, _score, text in parts:
+            if not text:
+                continue
+            if any(existing == text or text in existing for existing in merged_parts):
+                continue
+            merged_parts = [existing for existing in merged_parts if existing not in text]
+            merged_parts.append(text)
+        line_text = piece_joiner.join(merged_parts).strip()
+        if line_text and (not combined_lines or combined_lines[-1] != line_text):
+            combined_lines.append(line_text)
+    return line_joiner.join(combined_lines)
+
+
 def choose_subtitle_lines(result) -> tuple[str, str]:
     if not result:
         return "", ""
     frame_height = max(point[1] for box, _text, _score in result for point in box)
     bottom_threshold = frame_height * 0.82
-    english_candidates: list[tuple[float, float, str]] = []
-    chinese_candidates: list[tuple[float, float, str]] = []
+    y_tolerance = max(frame_height * 0.035, 18.0)
+    english_candidates: list[tuple[float, float, float, str]] = []
+    chinese_candidates: list[tuple[float, float, float, str]] = []
     for box, raw_text, score in result:
         average_y = sum(point[1] for point in box) / len(box)
+        average_x = sum(point[0] for point in box) / len(box)
         if average_y < bottom_threshold:
             continue
         text = str(raw_text).strip()
@@ -199,16 +237,14 @@ def choose_subtitle_lines(result) -> tuple[str, str]:
             continue
         if contains_cjk(text) and chinese_ratio(text) >= 0.35:
             chinese_text = normalize_chinese_text(text)
-            if len(chinese_text) >= 4:
-                chinese_candidates.append((average_y, float(score), chinese_text))
+            if len(chinese_text) >= DEFAULT_MIN_CHINESE_CHARS:
+                chinese_candidates.append((average_y, average_x, float(score), chinese_text))
             continue
         english_text = normalize_english_text(text)
         if ascii_ratio(english_text) >= 0.65 and len(english_text) >= 6:
-            english_candidates.append((average_y, float(score), english_text))
-    english_candidates.sort(key=lambda item: (item[0], item[1], len(item[2])))
-    chinese_candidates.sort(key=lambda item: (item[0], item[1], len(item[2])))
-    english_text = english_candidates[-1][2] if english_candidates else ""
-    chinese_text = chinese_candidates[-1][2] if chinese_candidates else ""
+            english_candidates.append((average_y, average_x, float(score), english_text))
+    english_text = combine_subtitle_candidates(english_candidates, piece_joiner=" ", line_joiner=" ", y_tolerance=y_tolerance)
+    chinese_text = combine_subtitle_candidates(chinese_candidates, piece_joiner="", line_joiner="", y_tolerance=y_tolerance)
     return english_text, chinese_text
 
 
@@ -237,6 +273,7 @@ def run_rapidocr_bilingual(frame_path: Path, engine: RapidOCR) -> tuple[str, str
 def collect_samples(frame_paths: list[Path], fps: float, min_chars: int, engine_name: str) -> list[OcrSample]:
     samples: list[OcrSample] = []
     frame_step = 1.0 / fps
+    min_chinese_chars = min(max(1, min_chars), DEFAULT_MIN_CHINESE_CHARS)
     rapidocr_engine = RapidOCR() if engine_name == "rapidocr" else None
     for index, frame_path in enumerate(frame_paths):
         if rapidocr_engine is not None:
@@ -244,7 +281,7 @@ def collect_samples(frame_paths: list[Path], fps: float, min_chars: int, engine_
         else:
             english_text = run_tesseract_ocr(frame_path)
             chinese_text = ""
-        if len(english_text) < min_chars and len(chinese_text) < min_chars:
+        if len(english_text) < min_chars and len(chinese_text) < min_chinese_chars:
             continue
         samples.append(OcrSample(time=index * frame_step, english_text=english_text, chinese_text=chinese_text))
     return samples
