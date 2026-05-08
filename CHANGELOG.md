@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.1.6] - 2026-05-08
+
+### Changed
+
+- Fixed GPT-SoVITS shell startup to launch from the GPT-SoVITS repository root so upstream relative imports and assets resolve correctly.
+- Fixed Demucs prewarm/runtime loading to use the packaged model index while still caching downloads under the repo-local runtime cache.
+- Fixed trimmed MP4 generation for 5.1-channel inputs by downmixing the preprocessed audio to stereo before AAC encoding.
+- Added a clearer CLI error and README note for malformed multi-line shell commands where a trailing backslash is followed by spaces.
+
 ## [0.1.5] - 2026-05-06
 
 ### Changed

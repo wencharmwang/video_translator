@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from ocr_subtitles import SubtitleBlock
 
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_TARGET_LANGUAGE = "zh-CN"
