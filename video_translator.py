@@ -46,6 +46,7 @@ DEFAULT_GPT_SOVITS_SPEED = 1.0
 DEFAULT_ASR_DEVICE = "auto"
 DEFAULT_ASR_COMPUTE_TYPE = "default"
 DEFAULT_DEMUCS_DEVICE = "auto"
+DEFAULT_DEMUCS_MODEL = "htdemucs_ft"
 DEFAULT_SUBTITLE_SOURCE = "auto"
 DEFAULT_OCR_FPS = 1.0
 DEFAULT_OCR_MIN_CHARS = 10
@@ -341,6 +342,11 @@ def parse_args() -> argparse.Namespace:
         help="Base speaking speed factor passed to GPT-SoVITS",
     )
     raw_args = sys.argv[1:]
+    if raw_args and not raw_args[0].startswith("-") and not raw_args[0].strip():
+        parser.error(
+            "received an empty positional input path. If you split the command across lines in zsh/bash, "
+            "the trailing `\\` must be the last character on the line with no spaces after it"
+        )
     if raw_args and not raw_args[0].startswith("-") and "--video" not in raw_args and "--input-dir" not in raw_args:
         candidate = Path(raw_args[0]).expanduser()
         inferred_flag = "--input-dir" if candidate.is_dir() else "--video"
@@ -386,13 +392,15 @@ def run_command(
     command: list[str],
     *,
     check: bool = True,
+    extra_env: dict[str, str] | None = None,
     heartbeat_message: str | None = None,
     heartbeat_interval: float = 20.0,
 ) -> subprocess.CompletedProcess[str]:
+    env = None if extra_env is None else {**os.environ, **extra_env}
     if heartbeat_message is None:
-        result = subprocess.run(command, text=True, capture_output=True)
+        result = subprocess.run(command, text=True, capture_output=True, env=env)
     else:
-        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         while True:
             try:
                 stdout, stderr = process.communicate(timeout=heartbeat_interval)
@@ -549,6 +557,8 @@ def trim_video(input_video: Path, output_video: Path, trim_start: float, trim_en
             "veryfast",
             "-crf",
             "18",
+            "-ac",
+            "2",
             "-c:a",
             "aac",
             "-b:a",
@@ -891,6 +901,12 @@ def runtime_demucs_model_dir() -> Path:
     return ensure_dir(runtime_cache_root() / "demucs")
 
 
+def runtime_demucs_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["TORCH_HOME"] = str(runtime_demucs_model_dir())
+    return env
+
+
 def log_progress(stage: str, current: int, total: int, *, detail: str = "") -> None:
     if total <= 0:
         return
@@ -1147,7 +1163,6 @@ def extract_audio(input_video: Path, workdir: Path) -> tuple[Path, Path]:
 
 def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs_device: str) -> tuple[Path, Path]:
     demucs_output = workdir / "demucs"
-    demucs_repo = runtime_demucs_model_dir()
     print(
         "[info] Demucs separation started "
         f"(device={demucs_device}). This step can take several minutes on long videos or on the first run."
@@ -1158,9 +1173,7 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs
             "-m",
             "demucs.separate",
             "-n",
-            "htdemucs_ft",
-            "--repo",
-            str(demucs_repo),
+            DEFAULT_DEMUCS_MODEL,
             "--two-stems=vocals",
             "-d",
             demucs_device,
@@ -1168,9 +1181,10 @@ def separate_with_demucs(speech_mix: Path, full_mix: Path, workdir: Path, demucs
             str(demucs_output),
             str(full_mix),
         ],
+        extra_env=runtime_demucs_env(),
         heartbeat_message="Demucs is still separating vocals and background...",
     )
-    separated_dir = demucs_output / "htdemucs_ft" / full_mix.stem
+    separated_dir = demucs_output / DEFAULT_DEMUCS_MODEL / full_mix.stem
     vocals = separated_dir / "vocals.wav"
     background = separated_dir / "no_vocals.wav"
     if not vocals.exists() or not background.exists():

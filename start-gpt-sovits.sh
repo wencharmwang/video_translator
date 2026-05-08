@@ -38,7 +38,7 @@ if curl -sS -m 3 "$URL/" >/dev/null 2>&1; then
 fi
 
 echo "[start] Starting GPT-SoVITS service at $URL"
-nohup env PYTHONPATH="$GPT_ROOT:$GPT_ROOT/GPT_SoVITS" "$PYTHON_BIN" "$API_SCRIPT" -a "$HOST" -p "$PORT" -c "$CONFIG_PATH" >"$LOG_PATH" 2>&1 &
+nohup env PYTHONPATH="$GPT_ROOT:$GPT_ROOT/GPT_SoVITS" sh -c 'cd "$1" && exec "$2" "$3" -a "$4" -p "$5" -c "$6"' _ "$GPT_ROOT" "$PYTHON_BIN" "$API_SCRIPT" "$HOST" "$PORT" "$CONFIG_PATH" >"$LOG_PATH" 2>&1 &
 echo $! > "$PID_PATH"
 
 for _ in {1..60}; do

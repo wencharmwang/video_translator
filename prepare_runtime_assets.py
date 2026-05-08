@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 DEFAULT_ASR_MODEL = "small"
 DEFAULT_MDX_MODEL = "UVR_MDXNET_KARA_2.onnx"
+DEFAULT_DEMUCS_MODEL = "htdemucs_ft"
 DEFAULT_HY_MODEL = "tencent/HY-MT1.5-1.8B"
 DEFAULT_CACHE_ROOT = Path(__file__).resolve().parent / ".video-translator" / "models"
 
@@ -92,7 +94,15 @@ def prepare_demucs_model(model_name: str) -> None:
     from demucs.pretrained import get_model
 
     print(f"[init] Preparing Demucs model cache: {model_name}")
-    get_model(model_name, repo=demucs_cache_dir())
+    previous_torch_home = os.environ.get("TORCH_HOME")
+    os.environ["TORCH_HOME"] = str(demucs_cache_dir())
+    try:
+        get_model(model_name)
+    finally:
+        if previous_torch_home is None:
+            os.environ.pop("TORCH_HOME", None)
+        else:
+            os.environ["TORCH_HOME"] = previous_torch_home
 
 
 def prepare_rapidocr() -> None:
@@ -108,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hy-device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument("--mdx-model", default=DEFAULT_MDX_MODEL)
-    parser.add_argument("--demucs-model", default="htdemucs_ft")
+    parser.add_argument("--demucs-model", default=DEFAULT_DEMUCS_MODEL)
     return parser.parse_args()
 
 
